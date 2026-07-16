@@ -1,0 +1,232 @@
+# ============================================================
+# Python environments and locally installed packages
+# ============================================================
+
+.venv/
+venv/
+env/
+ENV/
+
+.python-packages/
+.python_packages/
+site-packages/
+Lib/site-packages/
+
+.codex/
+
+# Python package managers / environment folders
+.conda/
+conda-meta/
+pip-wheel-metadata/
+
+# ============================================================
+# Python cache and compiled files
+# ============================================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ============================================================
+# Build and packaging outputs
+# ============================================================
+
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============================================================
+# Jupyter Notebook
+# ============================================================
+
+.ipynb_checkpoints/
+
+# Jupyter local configuration
+.jupyter/
+.ipython/
+
+# ============================================================
+# Data files
+# ============================================================
+
+*.csv
+*.tsv
+*.txt.gz
+*.csv.gz
+*.tsv.gz
+
+*.parquet
+*.feather
+*.arrow
+
+*.pkl
+*.pickle
+*.joblib
+
+*.h5
+*.hdf
+*.hdf5
+
+*.sav
+*.dta
+*.sas7bdat
+
+# Excel data
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+
+# Databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.duckdb
+
+# Compressed datasets / archives
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.bz2
+
+# ============================================================
+# Data directories
+# ============================================================
+
+data/
+data_raw/
+data_processed/
+data_intermediate/
+data_clean/
+data_output/
+database/
+databases/
+
+raw_data/
+processed_data/
+input_data/
+output_data/
+
+# ============================================================
+# Generated outputs
+# ============================================================
+
+outputs/
+output/
+results/
+reports/generated/
+temp/
+tmp/
+
+# Uncomment these if figures should also stay local
+# figures/
+# plots/
+# charts/
+
+# ============================================================
+# Model files
+# ============================================================
+
+models/
+checkpoints/
+
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.keras
+
+# ============================================================
+# Logs and temporary files
+# ============================================================
+
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+~$*
+*.autosave
+
+# ============================================================
+# Secrets and local configuration
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+secrets/
+credentials/
+
+*.pem
+*.key
+*.p12
+*.pfx
+
+config.local.py
+config_local.py
+local_config.py
+
+# ============================================================
+# IDE and editor settings
+# ============================================================
+
+.vscode/
+.idea/
+.spyproject/
+.ropeproject/
+
+# ============================================================
+# Operating system files
+# ============================================================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+ehthumbs.db
+
+# ============================================================
+# Git merge and patch files
+# ============================================================
+
+*.orig
+*.rej
+*.patch
