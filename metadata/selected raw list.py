@@ -170,7 +170,7 @@ WEGE_SELECTED_COLS = [
  # IDs / weights / filters
  "HP_ID", "H_ID", "P_ID", "W_ID",
  "W_GEW", "W_HOCH", "W_GEW_PKM", "W_HOCH_PKM",
- "MODE", "BASISAUF", "PROXY_01", "W_RBW",
+ "MODE", "BASISAUF", "PROXY_01", "W_RBW", "W_SO1",
 
  # Time
  "ST_MONAT", "ST_JAHR", "ST_WOTAG", "feiertag", "saison",
