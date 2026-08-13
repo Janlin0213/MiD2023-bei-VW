@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable
@@ -18,10 +19,13 @@ PHASE2_QA_PATH = DATA_PROCESSED / "phase2_QA_summary_v2.csv"
 
 CLASSIFIED_PATH = DATA_PROCESSED / "vehicle_choice_occasions_classified.csv"
 FUNNEL_PATH = DATA_PROCESSED / "phase3_sample_funnel.csv"
-LONG_PATH = DATA_PROCESSED / "mnl_vehicle_choice_long_base.csv"
+WIDE_PATH = DATA_PROCESSED / "mnl_vehicle_choice_wide_base.csv"
 QA_PATH = DATA_PROCESSED / "vehicle_availability_QA_summary.csv"
 
 VALID_A_IDS = {1, 2, 3}
+EXPECTED_ALL_OCCASIONS = 56_340
+EXPECTED_CORE_OCCASIONS = 32_805
+EXPECTED_STRICT_OCCASIONS = 30_816
 
 KEEP_CONTEXT_COLUMNS = [
     "W_ZWECK",
@@ -30,6 +34,38 @@ KEEP_CONTEXT_COLUMNS = [
     "H_ANZAUTO",
     "pkw_fmf",
 ]
+
+WIDE_COLUMNS = [
+    "CHOICE_ID",
+    "SOURCE_ROW_ID",
+    "H_ID",
+    "HP_ID",
+    "P_ID",
+    "W_ID",
+    "CHOICE",
+    "AV_1",
+    "AV_2",
+    "START_MIN",
+    "ARRIVAL_MIN",
+    "W_ZWECK",
+    "W_SO1",
+    "W_GEW",
+]
+
+FORBIDDEN_WIDE_COLUMNS = {
+    "TRIP_ID",
+    "CHOSEN_A_ID",
+    "alternative_A_ID",
+    "chosen",
+    "AVAILABLE_CAR_SET",
+    "N_AVAILABLE_CARS",
+    "H_ANZAUTO",
+    "pkw_fmf",
+    "VALID_STRICT_CHOICE_OCCASION",
+    "zweck",
+    "rbw_present_flag",
+    "rbw_pkw_mode_flag",
+}
 
 COLUMN_MAP = {
     "choice_id": "CHOICE_ID",
@@ -104,6 +140,10 @@ def integer_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype("string").str.strip(), errors="coerce")
 
 
+def numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series.astype("string").str.strip(), errors="coerce")
+
+
 def require_columns(df: pd.DataFrame, columns: Iterable[str], label: str) -> None:
     missing = [col for col in columns if col not in df.columns]
     if missing:
@@ -164,19 +204,6 @@ def load_optional_qa(path: Path) -> dict[str, int]:
         except ValueError:
             continue
     return out
-
-
-def print_column_inventory(occasions: pd.DataFrame, trips: pd.DataFrame, cars: pd.DataFrame) -> None:
-    print("\nPHASE 3 INPUT COLUMN INVENTORY")
-    print("vehicle_choice_occasions_all_v2.csv:")
-    print("|".join(occasions.columns))
-    print("\ntrips_home_chain_enriched.csv:")
-    print("|".join(trips.columns))
-    print("\ncars_selected_raw.csv:")
-    print("|".join(cars.columns))
-    print("\nPHASE 3 COLUMN MAPPING")
-    for logical, actual in COLUMN_MAP.items():
-        print(f"{logical}: {actual}")
 
 
 def validate_and_parse_occasions(occasions: pd.DataFrame) -> pd.DataFrame:
@@ -255,8 +282,31 @@ def validate_and_parse_occasions(occasions: pd.DataFrame) -> pd.DataFrame:
 
 def merge_context(occasions: pd.DataFrame, trips: pd.DataFrame) -> pd.DataFrame:
     context_cols = ["SOURCE_ROW_ID", *[col for col in KEEP_CONTEXT_COLUMNS if col in trips.columns]]
-    context = trips[context_cols].drop_duplicates("SOURCE_ROW_ID")
+    context = trips[context_cols].copy()
     return occasions.merge(context, on="SOURCE_ROW_ID", how="left", validate="many_to_one")
+
+
+def canonicalize_trip_purpose(occasions: pd.DataFrame) -> pd.DataFrame:
+    out = occasions.copy()
+    if "W_ZWECK" not in out.columns and "zweck" not in out.columns:
+        raise KeyError("Trip context must contain W_ZWECK or zweck.")
+    if "W_ZWECK" not in out.columns:
+        out["W_ZWECK"] = out["zweck"]
+    if "zweck" in out.columns:
+        canonical = out["W_ZWECK"].astype("string").str.strip()
+        fallback = out["zweck"].astype("string").str.strip()
+        mismatch = canonical.ne("") & fallback.ne("") & canonical.ne(fallback)
+        if mismatch.any():
+            print("\nW_ZWECK / zweck MISMATCHES IN PHASE 3 OCCASIONS")
+            print(
+                out.loc[mismatch, ["CHOICE_ID", "SOURCE_ROW_ID", "W_ZWECK", "zweck"]]
+                .head(10)
+                .to_string(index=False)
+            )
+            raise ValueError("W_ZWECK and zweck disagree in the Phase 3 occasion universe.")
+        out["W_ZWECK"] = canonical.mask(canonical.eq(""), fallback)
+        out = out.drop(columns="zweck")
+    return out
 
 
 def create_exclusion_flags(occasions: pd.DataFrame, fleet_pairs: set[tuple[str, int]]) -> pd.DataFrame:
@@ -362,99 +412,140 @@ def build_funnel(classified: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def expand_long(strict: pd.DataFrame, fleet_pairs: set[tuple[str, int]]) -> pd.DataFrame:
-    base_cols = [
-        "CHOICE_ID",
-        "TRIP_ID",
-        "H_ID",
-        "HP_ID",
-        "P_ID",
-        "W_ID",
-        "SOURCE_ROW_ID",
-        "START_MIN",
-        "ARRIVAL_MIN",
-        "CHOSEN_A_ID",
-        "N_AVAILABLE_CARS",
-        "AVAILABLE_CAR_SET",
-        "rbw_present_flag",
-        "rbw_pkw_mode_flag",
-        "VALID_STRICT_CHOICE_OCCASION",
-        *[col for col in KEEP_CONTEXT_COLUMNS if col in strict.columns],
-    ]
-    base_cols = list(dict.fromkeys(base_cols))
-    rows = []
-    for occ in strict.sort_values(["H_ID", "START_MIN", "SOURCE_ROW_ID"], kind="mergesort").itertuples(index=False):
-        record = occ._asdict()
-        for a_id in record["parsed_available_car_list"]:
-            row = {col: record[col] for col in base_cols if col in record}
-            row["alternative_A_ID"] = int(a_id)
-            row["chosen"] = int(int(record["CHOSEN_A_ID"]) == int(a_id))
-            rows.append(row)
-    long = pd.DataFrame(rows)
-    if not long.empty:
-        ordered_cols = [
+def merge_choice_weights(strict: pd.DataFrame, trips: pd.DataFrame) -> pd.DataFrame:
+    require_columns(trips, ["SOURCE_ROW_ID", "W_GEW"], "trip weight source")
+    source_ids = trips["SOURCE_ROW_ID"].astype("string").str.strip()
+    bad_source_ids = source_ids.eq("") | source_ids.duplicated(keep=False)
+    if bad_source_ids.any():
+        print("\nMISSING OR DUPLICATE SOURCE_ROW_ID VALUES IN TRIP WEIGHT SOURCE")
+        print(trips.loc[bad_source_ids, ["SOURCE_ROW_ID", "W_GEW"]].head(10).to_string(index=False))
+        raise ValueError("SOURCE_ROW_ID must be non-missing and unique in the source trip table.")
+
+    source_weights = numeric(trips["W_GEW"])
+    nonnumeric = trips["W_GEW"].astype("string").str.strip().ne("") & source_weights.isna()
+    if nonnumeric.any():
+        print("\nNON-NUMERIC W_GEW VALUES IN TRIP WEIGHT SOURCE")
+        print(trips.loc[nonnumeric, ["SOURCE_ROW_ID", "W_GEW"]].head(10).to_string(index=False))
+        raise ValueError("W_GEW contains non-numeric values in the source trip table.")
+
+    strict_ids = strict["SOURCE_ROW_ID"].astype("string").str.strip()
+    bad_strict_ids = strict_ids.eq("") | strict_ids.duplicated(keep=False)
+    if bad_strict_ids.any():
+        print("\nMISSING OR DUPLICATE SOURCE_ROW_ID VALUES IN STRICT OCCASIONS")
+        print(strict.loc[bad_strict_ids, ["CHOICE_ID", "SOURCE_ROW_ID"]].head(10).to_string(index=False))
+        raise ValueError("SOURCE_ROW_ID must be non-missing and unique in the strict occasion sample.")
+
+    weights = trips[["SOURCE_ROW_ID"]].copy()
+    weights["W_GEW"] = source_weights
+    before_choice_ids = strict["CHOICE_ID"].tolist()
+    before_source_ids = strict["SOURCE_ROW_ID"].tolist()
+    merged = strict.merge(weights, on="SOURCE_ROW_ID", how="left", validate="one_to_one", indicator=True)
+    if (
+        len(merged) != len(strict)
+        or merged["CHOICE_ID"].tolist() != before_choice_ids
+        or merged["SOURCE_ROW_ID"].tolist() != before_source_ids
+        or merged["_merge"].ne("both").any()
+    ):
+        print("\nSTRICT WEIGHT MERGE FAILURES")
+        print(merged.loc[merged["_merge"].ne("both"), ["CHOICE_ID", "SOURCE_ROW_ID", "_merge"]].head(10).to_string(index=False))
+        raise ValueError("The one-to-one W_GEW merge lost, created, or failed to match strict occasions.")
+    return merged.drop(columns="_merge")
+
+
+def build_wide(strict: pd.DataFrame, fleet_pairs: set[tuple[str, int]]) -> pd.DataFrame:
+    require_columns(strict, [*WIDE_COLUMNS[:6], "CHOSEN_A_ID", "parsed_available_car_list", *WIDE_COLUMNS[9:]], "strict occasion")
+    # CHOICE_ID identifies the trip-based choice occasion; TRIP_ID stays in the QA master only.
+    wide = strict[["CHOICE_ID", "SOURCE_ROW_ID", "H_ID", "HP_ID", "P_ID", "W_ID"]].copy()
+    wide["CHOICE"] = integer_series(strict["CHOSEN_A_ID"])
+    # AVAILABLE_CAR_SET remains reconstruction metadata; AV_1/AV_2 are the Biogeme representation.
+    wide["AV_1"] = strict["parsed_available_car_list"].map(lambda values: int(1 in values))
+    wide["AV_2"] = strict["parsed_available_car_list"].map(lambda values: int(2 in values))
+    for col in ["START_MIN", "ARRIVAL_MIN", "W_ZWECK", "W_SO1", "W_GEW"]:
+        wide[col] = strict[col]
+    wide = wide[WIDE_COLUMNS]
+    validate_wide(strict, wide, fleet_pairs)
+    return wide
+
+
+def validate_wide(
+    strict: pd.DataFrame,
+    wide: pd.DataFrame,
+    fleet_pairs: set[tuple[str, int]],
+) -> None:
+    if list(wide.columns) != WIDE_COLUMNS:
+        raise ValueError(f"Wide columns differ from the required ordered schema: {list(wide.columns)}")
+    forbidden = sorted(FORBIDDEN_WIDE_COLUMNS.intersection(wide.columns))
+    if forbidden:
+        raise ValueError(f"Long-format or redundant columns remain in the wide output: {forbidden}")
+
+    choice_missing = wide["CHOICE_ID"].isna() | wide["CHOICE_ID"].astype("string").str.strip().eq("")
+    choice_duplicate = wide["CHOICE_ID"].duplicated(keep=False)
+    source_missing = wide["SOURCE_ROW_ID"].isna() | wide["SOURCE_ROW_ID"].astype("string").str.strip().eq("")
+    source_duplicate = wide["SOURCE_ROW_ID"].duplicated(keep=False)
+    if choice_missing.any() or choice_duplicate.any() or source_missing.any() or source_duplicate.any():
+        bad = choice_missing | choice_duplicate | source_missing | source_duplicate
+        print("\nINVALID WIDE IDENTIFIERS")
+        print(wide.loc[bad, ["CHOICE_ID", "SOURCE_ROW_ID"]].head(10).to_string(index=False))
+        raise ValueError("Wide CHOICE_ID and SOURCE_ROW_ID must each be non-missing and unique.")
+
+    choice_to_source = wide.groupby("CHOICE_ID")["SOURCE_ROW_ID"].nunique(dropna=False)
+    source_to_choice = wide.groupby("SOURCE_ROW_ID")["CHOICE_ID"].nunique(dropna=False)
+    if not choice_to_source.eq(1).all() or not source_to_choice.eq(1).all():
+        raise ValueError("CHOICE_ID and SOURCE_ROW_ID must have a one-to-one mapping.")
+
+    choice = integer_series(wide["CHOICE"])
+    av_1 = integer_series(wide["AV_1"])
+    av_2 = integer_series(wide["AV_2"])
+    structural_bad = ~choice.isin({1, 2}) | ~av_1.isin({0, 1}) | ~av_2.isin({0, 1})
+    availability_bad = av_1.ne(1) | av_2.ne(1) | ((choice.eq(1) & av_1.ne(1)) | (choice.eq(2) & av_2.ne(1)))
+    if structural_bad.any() or availability_bad.any():
+        print("\nINVALID CHOICE OR AVAILABILITY VALUES")
+        print(wide.loc[structural_bad | availability_bad, ["CHOICE_ID", "CHOICE", "AV_1", "AV_2"]].head(10).to_string(index=False))
+        raise ValueError("Strict wide rows require CHOICE in {1,2}, binary AV values, and AV_1 == AV_2 == 1.")
+
+    complete_fleet = integer_series(strict["complete_fleet_baseline_flag"]).eq(1)
+    two_cars = integer_series(strict["N_AVAILABLE_CARS"]).eq(2)
+    two_car_set = strict["parsed_available_car_list"].map(lambda values: values == [1, 2])
+    household_two_cars = integer_series(strict["H_ANZAUTO"]).eq(2)
+    car_driver_trip = integer_series(strict["pkw_fmf"]).eq(1)
+    strict_valid = integer_series(strict["VALID_STRICT_CHOICE_OCCASION"]).eq(1)
+    baseline_bad = ~(complete_fleet & two_cars & two_car_set & household_two_cars & car_driver_trip & strict_valid)
+    if baseline_bad.any():
+        cols = [
             "CHOICE_ID",
-            "TRIP_ID",
             "H_ID",
-            "HP_ID",
-            "P_ID",
-            "W_ID",
-            "SOURCE_ROW_ID",
-            "START_MIN",
-            "ARRIVAL_MIN",
-            "alternative_A_ID",
-            "CHOSEN_A_ID",
-            "chosen",
-            "N_AVAILABLE_CARS",
+            "complete_fleet_baseline_flag",
+            "H_ANZAUTO",
+            "pkw_fmf",
             "AVAILABLE_CAR_SET",
-            "rbw_present_flag",
-            "rbw_pkw_mode_flag",
-            *[col for col in KEEP_CONTEXT_COLUMNS if col in long.columns],
+            "N_AVAILABLE_CARS",
+            "CHOSEN_A_ID",
             "VALID_STRICT_CHOICE_OCCASION",
         ]
-        long = long[[col for col in ordered_cols if col in long.columns]]
-    validate_long(strict, long, fleet_pairs)
-    return long
+        print("\nSTRICT ROWS OUTSIDE THE COMPLETE TWO-CAR BASELINE")
+        print(strict.loc[baseline_bad, cols].head(10).to_string(index=False))
+        raise ValueError("All strict rows must belong to the intended complete two-car baseline.")
 
-
-def validate_long(strict: pd.DataFrame, long: pd.DataFrame, fleet_pairs: set[tuple[str, int]]) -> None:
-    if strict.empty:
-        assert long.empty, "Long file must be empty when there are no strict occasions."
-        return
-    duplicate_choices = strict[COLUMN_MAP["choice_id"]].duplicated(keep=False)
-    assert not duplicate_choices.any(), "Strict occasion sample has duplicate CHOICE_ID values."
-    bad_n = strict.loc[integer_series(strict["N_AVAILABLE_CARS"]).ne(2)]
-    if not bad_n.empty:
-        print("\nSTRICT OCCASIONS WITHOUT EXACTLY TWO ALTERNATIVES")
-        print(bad_n.to_string(index=False))
-    assert bad_n.empty, "Strict baseline must have exactly two available cars."
-
-    chosen_sum = long.groupby("CHOICE_ID")["chosen"].sum()
-    assert chosen_sum.eq(1).all(), "Each CHOICE_ID must have exactly one chosen alternative."
-    alt_count = long.groupby("CHOICE_ID")["alternative_A_ID"].count()
-    n_available = strict.set_index("CHOICE_ID")["N_AVAILABLE_CARS"].astype(int)
-    assert alt_count.equals(n_available.loc[alt_count.index]), "Long row count must equal N_AVAILABLE_CARS."
-    chosen_rows = long[long["chosen"].astype(int).eq(1)]
-    assert (
-        chosen_rows["alternative_A_ID"].astype(int).eq(chosen_rows["CHOSEN_A_ID"].astype(int))
-    ).all(), "Chosen alternative must match CHOSEN_A_ID."
     bad_fleet = [
-        (str(row.H_ID), int(row.alternative_A_ID))
-        for row in long.itertuples(index=False)
-        if (str(row.H_ID), int(row.alternative_A_ID)) not in fleet_pairs
+        (str(h_id), a_id)
+        for h_id in strict["H_ID"]
+        for a_id in (1, 2)
+        if (str(h_id), a_id) not in fleet_pairs
     ]
-    assert not bad_fleet, f"Long-format alternatives outside fleet: {bad_fleet[:10]}"
-    assert alt_count.eq(2).all(), "Strict baseline CHOICE_ID values must have exactly two long rows."
-    duplicate_alts = long.groupby(["CHOICE_ID", "alternative_A_ID"]).size().gt(1).any()
-    assert not duplicate_alts, "alternative_A_ID must be unique within CHOICE_ID."
-    assert long["VALID_STRICT_CHOICE_OCCASION"].astype(int).eq(1).all(), "Long file contains excluded occasions."
-    context_cols = [
-        col
-        for col in long.columns
-        if col not in {"alternative_A_ID", "chosen"}
-    ]
-    inconsistent = long.groupby("CHOICE_ID")[context_cols].nunique(dropna=False).gt(1).any(axis=1)
-    assert not inconsistent.any(), "Context variables must be identical within CHOICE_ID."
+    if bad_fleet:
+        raise ValueError(f"Strict wide alternatives outside the recorded fleet: {bad_fleet[:10]}")
+
+    weights = numeric(wide["W_GEW"])
+    populated = wide["W_GEW"].astype("string").str.strip().ne("")
+    weight_bad = (~populated) | weights.isna() | ~weights.map(lambda value: math.isfinite(value) if not pd.isna(value) else False) | weights.le(0)
+    if weight_bad.any():
+        print("\nINVALID STRICT W_GEW VALUES")
+        print(wide.loc[weight_bad, ["CHOICE_ID", "SOURCE_ROW_ID", "W_GEW"]].head(10).to_string(index=False))
+        raise ValueError("Strict W_GEW values must be numeric, non-missing, finite, and strictly positive.")
+    wide["W_GEW"] = weights
+
+    if len(wide) != len(strict) or wide["CHOICE_ID"].nunique() != len(strict):
+        raise ValueError("Wide row and unique CHOICE_ID counts must equal the strict occasion count.")
 
 
 def prevalence_rows(classified: pd.DataFrame) -> list[dict]:
@@ -483,6 +574,33 @@ def qa_row(section: str, metric: str, count: int, denominator: int, denominator_
     }
 
 
+def qa_stat_row(metric: str, value: float | int) -> dict:
+    return {
+        "section": "WEIGHT QA",
+        "metric": metric,
+        "count": value,
+        "share": "",
+        "denominator_description": "strict wide choice occasions",
+    }
+
+
+def weight_stats(values: pd.Series) -> dict[str, float | int]:
+    weights = numeric(values)
+    return {
+        "missing W_GEW": int(weights.isna().sum()),
+        "zero W_GEW": int(weights.eq(0).sum()),
+        "negative W_GEW": int(weights.lt(0).sum()),
+        "minimum W_GEW": float(weights.min()),
+        "maximum W_GEW": float(weights.max()),
+        "mean W_GEW": float(weights.mean()),
+        "median W_GEW": float(weights.median()),
+        "p01 W_GEW": float(weights.quantile(0.01)),
+        "p05 W_GEW": float(weights.quantile(0.05)),
+        "p95 W_GEW": float(weights.quantile(0.95)),
+        "p99 W_GEW": float(weights.quantile(0.99)),
+    }
+
+
 def add_distribution_rows(rows: list[dict], section: str, label: str, data: pd.DataFrame, denom_desc: str) -> None:
     denom = len(data)
     n_available = integer_series(data["N_AVAILABLE_CARS"])
@@ -505,7 +623,7 @@ def add_value_distribution_rows(
 
 def build_qa_summary(
     classified: pd.DataFrame,
-    long: pd.DataFrame,
+    wide: pd.DataFrame,
     funnel: pd.DataFrame,
     phase1_qa: dict[str, int],
     phase2_qa: dict[str, int],
@@ -526,21 +644,23 @@ def build_qa_summary(
     for metric, count, denom, desc in phase1_metrics:
         rows.append(qa_row("PHASE 1 / INPUT CONTEXT", metric, count, denom, desc))
 
-    phase2_metrics = [
-        "identifiable household-car driver trips",
-        "complete-time identifiable driver trips",
-        "incomplete-time identifiable driver trips",
-        "events excluded from strict timeline",
-        "home-origin choice occasions",
-        "invalid snapshot cases",
-        "true availability conflicts",
-        "unknown snapshot occasions",
-        "simultaneous home-departure occasions",
-        "same-vehicle simultaneous departures",
-    ]
-    for metric in phase2_metrics:
-        rows.append(qa_row("PHASE 2 RECONSTRUCTION", metric, phase2_qa.get(metric, 0), phase2_qa.get("home-origin choice occasions", initial), "accepted Phase 2 v2 QA"))
     vehicle_events = phase2_qa.get("vehicle departure events", 0) + phase2_qa.get("vehicle arrival events", 0)
+    identifiable_trips = phase2_qa.get("identifiable household-car driver trips", 0)
+    home_origin_occasions = phase2_qa.get("home-origin choice occasions", initial)
+    phase2_metrics = [
+        ("identifiable household-car driver trips", "identifiable household-car driver trips", identifiable_trips, "identifiable household-car driver trips"),
+        ("complete-time identifiable driver trips", "complete-time identifiable driver trips", identifiable_trips, "identifiable household-car driver trips"),
+        ("Phase 2 incomplete-time identifiable driver trips", "incomplete-time identifiable driver trips", identifiable_trips, "all identifiable driver trips, including non-home-origin trips"),
+        ("events excluded from strict timeline", "events excluded from strict timeline", vehicle_events, "Phase 2 vehicle events"),
+        ("home-origin choice occasions", "home-origin choice occasions", home_origin_occasions, "Phase 2 home-origin choice occasions"),
+        ("Phase 2 invalid snapshot home-origin occasions", "invalid snapshot cases", home_origin_occasions, "Phase 2 home-origin choice occasions only"),
+        ("true availability conflicts", "true availability conflicts", home_origin_occasions, "Phase 2 home-origin choice occasions"),
+        ("unknown snapshot occasions", "unknown snapshot occasions", home_origin_occasions, "Phase 2 home-origin choice occasions"),
+        ("simultaneous home-departure occasions", "simultaneous home-departure occasions", home_origin_occasions, "Phase 2 home-origin choice occasions"),
+        ("same-vehicle simultaneous departures", "same-vehicle simultaneous departures", home_origin_occasions, "Phase 2 home-origin choice occasions"),
+    ]
+    for label, source_metric, denominator, description in phase2_metrics:
+        rows.append(qa_row("PHASE 2 RECONSTRUCTION", label, phase2_qa.get(source_metric, 0), denominator, description))
     rows.append(qa_row("PHASE 2 RECONSTRUCTION", "vehicle events", vehicle_events, max(vehicle_events, 1), "accepted Phase 2 v2 events"))
 
     add_distribution_rows(rows, "AVAILABILITY DISTRIBUTION BEFORE FILTERING", "all home-origin occasions", classified, "all home-origin choice occasions")
@@ -571,119 +691,84 @@ def build_qa_summary(
 
     rows.append(qa_row("STRICT SAMPLE OUTPUT", "strict MNL CHOICE_ID values", strict["CHOICE_ID"].nunique(), len(strict), "strict valid choice occasions"))
     rows.append(qa_row("STRICT SAMPLE OUTPUT", "strict MNL households", strict["H_ID"].nunique(), households, "all home-origin choice households"))
-    rows.append(qa_row("STRICT SAMPLE OUTPUT", "strict long-format rows", len(long), max(len(strict) * 2, 1), "expected two rows per strict choice occasion"))
-    add_value_distribution_rows(rows, "STRICT SAMPLE OUTPUT", "distribution of CHOSEN_A_ID", strict["CHOSEN_A_ID"], len(strict), "strict valid choice occasions")
-    add_value_distribution_rows(rows, "STRICT SAMPLE OUTPUT", "distribution of N_AVAILABLE_CARS", strict["N_AVAILABLE_CARS"], len(strict), "strict valid choice occasions")
+    rows.append(qa_row("STRICT SAMPLE OUTPUT", "strict wide-format rows", len(wide), max(len(strict), 1), "one wide row per strict choice occasion"))
+    rows.append(qa_row("STRICT SAMPLE OUTPUT", "strict unique CHOICE_ID", wide["CHOICE_ID"].nunique(), max(len(strict), 1), "strict valid choice occasions"))
+    add_value_distribution_rows(rows, "STRICT SAMPLE OUTPUT", "CHOICE distribution", wide["CHOICE"], len(wide), "strict wide choice occasions")
+    add_value_distribution_rows(rows, "STRICT SAMPLE OUTPUT", "AV_1 distribution", wide["AV_1"], len(wide), "strict wide choice occasions")
+    add_value_distribution_rows(rows, "STRICT SAMPLE OUTPUT", "AV_2 distribution", wide["AV_2"], len(wide), "strict wide choice occasions")
 
-    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "home-origin occasions in rbW-present households", int(classified["rbw_present_flag"].astype(int).sum()), initial, "all home-origin choice occasions"))
-    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "core occasions in rbW-present households", int(core["rbw_present_flag"].astype(int).sum()), max(len(core), 1), "valid core occasions"))
-    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "strict occasions in rbW-present households", int(strict["rbw_present_flag"].astype(int).sum()), max(len(strict), 1), "strict valid choice occasions"))
-    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "home-origin occasions in rbW-Pkw-mode households", int(classified["rbw_pkw_mode_flag"].astype(int).sum()), initial, "all home-origin choice occasions"))
-    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "core occasions in rbW-Pkw-mode households", int(core["rbw_pkw_mode_flag"].astype(int).sum()), max(len(core), 1), "valid core occasions"))
-    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "strict occasions in rbW-Pkw-mode households", int(strict["rbw_pkw_mode_flag"].astype(int).sum()), max(len(strict), 1), "strict valid choice occasions"))
+    # rbW rows were excluded upstream; these flags describe households, not the current occasions.
+    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "home-origin occasions in households with any rbW record", int(classified["rbw_present_flag"].astype(int).sum()), initial, "all home-origin choice occasions"))
+    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "core occasions in households with any rbW record", int(core["rbw_present_flag"].astype(int).sum()), max(len(core), 1), "valid core occasions"))
+    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "strict occasions in households with any rbW record", int(strict["rbw_present_flag"].astype(int).sum()), max(len(strict), 1), "strict valid choice occasions"))
+    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "home-origin occasions in households with any rbW Pkw-mode record", int(classified["rbw_pkw_mode_flag"].astype(int).sum()), initial, "all home-origin choice occasions"))
+    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "core occasions in households with any rbW Pkw-mode record", int(core["rbw_pkw_mode_flag"].astype(int).sum()), max(len(core), 1), "valid core occasions"))
+    rows.append(qa_row("DESCRIPTIVE rbW FLAGS", "strict occasions in households with any rbW Pkw-mode record", int(strict["rbw_pkw_mode_flag"].astype(int).sum()), max(len(strict), 1), "strict valid choice occasions"))
+
+    rows.append(qa_stat_row("strict wide rows", len(wide)))
+    rows.append(qa_stat_row("strict unique CHOICE_ID", wide["CHOICE_ID"].nunique()))
+    rows.extend(qa_stat_row(metric, value) for metric, value in weight_stats(wide["W_GEW"]).items())
     return pd.DataFrame(rows)
 
 
-def print_examples(classified: pd.DataFrame, long: pd.DataFrame) -> None:
-    print("\nSTRICT CHOICE_ID EXAMPLES")
-    example_cols = [
-        "CHOICE_ID",
-        "H_ID",
-        "HP_ID",
-        "P_ID",
-        "W_ID",
-        "AVAILABLE_CAR_SET",
-        "N_AVAILABLE_CARS",
-        "CHOSEN_A_ID",
-        "alternative_A_ID",
-        "chosen",
-    ]
-    print(long[example_cols].head(20).to_string(index=False) if not long.empty else "(none)")
-
-    print("\nEXCLUDED OCCASION EXAMPLES")
-    targets = [
-        ("invalid snapshot", "EXCL_INVALID_SNAPSHOT"),
-        ("unknown snapshot", "EXCL_UNKNOWN_SNAPSHOT"),
-        ("availability conflict", "EXCL_AVAILABILITY_CONFLICT"),
-        ("one available car", "one_available_case_flag"),
-        ("simultaneous departure", "EXCL_SIMULTANEOUS_DEPARTURE"),
-        ("household time unresolved", "EXCL_HOUSEHOLD_TIME_UNRESOLVED"),
-        ("vehicle overlap", "EXCL_VEHICLE_OVERLAP"),
-        ("location-transition conflict", "EXCL_LOCATION_TRANSITION_CONFLICT"),
-    ]
-    rows = []
-    for label, flag in targets:
-        if flag not in classified.columns:
-            continue
-        sample = classified.loc[classified[flag].astype(int).eq(1)].head(2).copy()
-        if sample.empty:
-            continue
-        sample.insert(0, "example_type", label)
-        rows.append(sample)
-    if rows:
-        examples = pd.concat(rows, ignore_index=True)
-        cols = [
-            "example_type",
-            "CHOICE_ID",
-            "H_ID",
-            "HP_ID",
-            "P_ID",
-            "W_ID",
-            "START_MIN",
-            "AVAILABLE_CAR_SET",
-            "N_AVAILABLE_CARS",
-            "CHOSEN_A_ID",
-            "PRIMARY_EXCLUSION_REASON",
-            "ALL_EXCLUSION_REASONS",
-        ]
-        print(examples[[col for col in cols if col in examples.columns]].head(20).to_string(index=False))
-    else:
-        print("(none)")
+def print_reference_checks(classified: pd.DataFrame, wide: pd.DataFrame) -> None:
+    actual = {
+        "all home-origin occasions": len(classified),
+        "VALID_CORE_OCCASION": int(classified["VALID_CORE_OCCASION"].sum()),
+        "VALID_STRICT_CHOICE_OCCASION": int(classified["VALID_STRICT_CHOICE_OCCASION"].sum()),
+        "strict wide rows": len(wide),
+        "strict unique CHOICE_ID": wide["CHOICE_ID"].nunique(),
+    }
+    expected = {
+        "all home-origin occasions": EXPECTED_ALL_OCCASIONS,
+        "VALID_CORE_OCCASION": EXPECTED_CORE_OCCASIONS,
+        "VALID_STRICT_CHOICE_OCCASION": EXPECTED_STRICT_OCCASIONS,
+        "strict wide rows": EXPECTED_STRICT_OCCASIONS,
+        "strict unique CHOICE_ID": EXPECTED_STRICT_OCCASIONS,
+    }
+    drift = {metric: (actual[metric], target) for metric, target in expected.items() if actual[metric] != target}
+    if drift:
+        print("\nWARNING: PHASE 3 REFERENCE COUNTS CHANGED")
+        for metric, (observed, target) in drift.items():
+            print(f"{metric}: observed {observed:,}; accepted reference {target:,}")
 
 
-def print_final_results(classified: pd.DataFrame, funnel: pd.DataFrame, long: pd.DataFrame, stage_times: dict[str, float]) -> None:
+def print_final_results(classified: pd.DataFrame, wide: pd.DataFrame, stage_times: dict[str, float]) -> None:
     strict = classified[classified["VALID_STRICT_CHOICE_OCCASION"].eq(1)]
     core = classified[classified["VALID_CORE_OCCASION"].eq(1)]
-    print("\nPHASE 3 OUTPUT PATHS")
-    print(f"vehicle_choice_occasions_classified: {CLASSIFIED_PATH}")
-    print(f"phase3_sample_funnel: {FUNNEL_PATH}")
-    print(f"mnl_vehicle_choice_long_base: {LONG_PATH}")
-    print(f"vehicle_availability_QA_summary: {QA_PATH}")
-
     print("\nPHASE 3 FINAL COUNTS")
     print(f"all home-origin occasions: {len(classified):,}")
     print(f"VALID_CORE_OCCASION: {len(core):,}")
     print(f"VALID_STRICT_CHOICE_OCCASION: {len(strict):,}")
-    print(f"strict long-format rows: {len(long):,}")
-    print(f"strict CHOICE_ID count: {long['CHOICE_ID'].nunique() if not long.empty else 0:,}")
-    print(f"strict household count: {strict['H_ID'].nunique():,}")
+    print(f"strict wide-format rows: {len(wide):,}")
+    print(f"strict unique CHOICE_ID: {wide['CHOICE_ID'].nunique():,}")
+    print(f"strict households: {strict['H_ID'].nunique():,}")
 
-    print("\nSEQUENTIAL FUNNEL")
-    print(funnel.to_string(index=False))
+    print("\nCHOICE DISTRIBUTION")
+    print(wide["CHOICE"].value_counts().sort_index().to_string())
 
-    print("\nRAW EXCLUSION FLAG COUNTS")
-    for _, flag in ALL_STEPS:
-        print(f"{flag}: {int(classified[flag].sum()):,}")
+    print("\nAVAILABILITY")
+    print(f"AV_1 == 1: {int(integer_series(wide['AV_1']).eq(1).sum()):,}")
+    print(f"AV_2 == 1: {int(integer_series(wide['AV_2']).eq(1).sum()):,}")
 
-    print("\nCHOSEN_A_ID DISTRIBUTION BEFORE STRICT")
-    print(classified["CHOSEN_A_ID"].value_counts().sort_index().to_string())
-    print("\nCHOSEN_A_ID DISTRIBUTION AFTER STRICT")
-    print(strict["CHOSEN_A_ID"].value_counts().sort_index().to_string())
+    stats = weight_stats(wide["W_GEW"])
+    print("\nWEIGHT QA")
+    print(f"missing W_GEW: {stats['missing W_GEW']:,}")
+    print(
+        "min / max / mean / median W_GEW: "
+        f"{stats['minimum W_GEW']:.6g} / {stats['maximum W_GEW']:.6g} / "
+        f"{stats['mean W_GEW']:.6g} / {stats['median W_GEW']:.6g}"
+    )
 
-    print("\nN_AVAILABLE_CARS DISTRIBUTION BEFORE STRICT")
-    print(classified["N_AVAILABLE_CARS"].value_counts().sort_index().to_string())
-    print("\nN_AVAILABLE_CARS DISTRIBUTION AFTER STRICT")
-    print(strict["N_AVAILABLE_CARS"].value_counts().sort_index().to_string())
-
-    print("\nSTRICT rbW DESCRIPTIVE FLAGS")
-    print(f"rbw_present_flag strict occasions: {int(strict['rbw_present_flag'].astype(int).sum()):,}")
-    print(f"rbw_pkw_mode_flag strict occasions: {int(strict['rbw_pkw_mode_flag'].astype(int).sum()):,}")
+    print("\nOUTPUTS")
+    print(CLASSIFIED_PATH.name)
+    print(FUNNEL_PATH.name)
+    print(WIDE_PATH.name)
+    print(QA_PATH.name)
 
     print("\nRUNTIME BY STAGE")
     for name, seconds in stage_times.items():
         print(f"{name}: {seconds:.2f}s")
-
-    print_examples(classified, long)
 
 
 def main() -> None:
@@ -693,38 +778,41 @@ def main() -> None:
     stage_start = perf_counter()
     occasions = read_csv_strings(OCCASIONS_PATH)
     trip_header = pd.read_csv(TRIPS_PATH, nrows=0).columns.tolist()
-    trip_cols = ["SOURCE_ROW_ID", *[col for col in KEEP_CONTEXT_COLUMNS if col in trip_header]]
+    trip_cols = ["SOURCE_ROW_ID", *[col for col in KEEP_CONTEXT_COLUMNS if col in trip_header], "W_GEW"]
+    trip_cols = list(dict.fromkeys(trip_cols))
     trips = read_csv_strings(TRIPS_PATH, usecols=trip_cols)
     cars = read_csv_strings(CARS_PATH, usecols=["H_ID", "A_ID"])
     phase1_qa = load_optional_qa(PHASE1_QA_PATH)
     phase2_qa = load_optional_qa(PHASE2_QA_PATH)
     stage_times["loading"] = perf_counter() - stage_start
 
-    print_column_inventory(occasions, trips, cars)
-
     stage_start = perf_counter()
     fleet_pairs = build_fleet_pairs(cars)
     classified = validate_and_parse_occasions(occasions)
     classified = merge_context(classified, trips)
+    classified = canonicalize_trip_purpose(classified)
     classified = create_exclusion_flags(classified, fleet_pairs)
     funnel = build_funnel(classified)
     stage_times["classification and funnel"] = perf_counter() - stage_start
 
     stage_start = perf_counter()
     strict = classified[classified["VALID_STRICT_CHOICE_OCCASION"].eq(1)].copy()
-    long = expand_long(strict, fleet_pairs)
-    stage_times["long-format expansion"] = perf_counter() - stage_start
+    # W_GEW is merged once at the choice level; one wide row is one strict vehicle choice occasion.
+    strict = merge_choice_weights(strict, trips)
+    wide = build_wide(strict, fleet_pairs)
+    stage_times["strict weight merge and wide construction"] = perf_counter() - stage_start
 
     stage_start = perf_counter()
-    qa = build_qa_summary(classified, long, funnel, phase1_qa, phase2_qa)
+    qa = build_qa_summary(classified, wide, funnel, phase1_qa, phase2_qa)
     classified.to_csv(CLASSIFIED_PATH, index=False)
     funnel.to_csv(FUNNEL_PATH, index=False)
-    long.to_csv(LONG_PATH, index=False)
+    wide.to_csv(WIDE_PATH, index=False)
     qa.to_csv(QA_PATH, index=False)
     stage_times["CSV writing"] = perf_counter() - stage_start
     stage_times["total"] = perf_counter() - total_t0
 
-    print_final_results(classified, funnel, long, stage_times)
+    print_reference_checks(classified, wide)
+    print_final_results(classified, wide, stage_times)
     print("\nPhase 3 complete.")
 
 

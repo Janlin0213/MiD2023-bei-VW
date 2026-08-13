@@ -32,8 +32,7 @@ DRIVER_DISTRIBUTION_PATH = RESULTS / "driver_degree_distribution.csv"
 VEHICLE_DISTRIBUTION_PATH = RESULTS / "vehicle_degree_distribution.csv"
 HOUSEHOLD_CELL_DISTRIBUTION_PATH = RESULTS / "household_mapping_cell_distribution.csv"
 
-DRIVER_FIGURE_PATH = FIGURES / "driver_degree_distribution.png"
-VEHICLE_FIGURE_PATH = FIGURES / "vehicle_degree_distribution.png"
+DEGREE_DUAL_PANEL_FIGURE_PATH = FIGURES / "driver_vehicle_degree_distribution_dual_panel.png"
 HOUSEHOLD_CELL_FIGURE_PATH = FIGURES / "household_mapping_cell_distribution.png"
 HOUSEHOLD_COVERAGE_FIGURE_PATH = FIGURES / "household_observation_coverage.png"
 
@@ -45,14 +44,12 @@ ORIGINAL_OUTPUT_PATHS = [
     DRIVER_DISTRIBUTION_PATH,
     VEHICLE_DISTRIBUTION_PATH,
     HOUSEHOLD_CELL_DISTRIBUTION_PATH,
-    DRIVER_FIGURE_PATH,
-    VEHICLE_FIGURE_PATH,
 ]
 NEW_FIGURE_PATHS = [
     HOUSEHOLD_CELL_FIGURE_PATH,
     HOUSEHOLD_COVERAGE_FIGURE_PATH,
 ]
-OUTPUT_PATHS = ORIGINAL_OUTPUT_PATHS + NEW_FIGURE_PATHS
+OUTPUT_PATHS = ORIGINAL_OUTPUT_PATHS + [DEGREE_DUAL_PANEL_FIGURE_PATH] + NEW_FIGURE_PATHS
 
 VALID_A_IDS = {1, 2, 3}
 EXPECTED_DEPARTURE_ROWS = 139_546
@@ -468,6 +465,43 @@ def save_bar_chart(labels: list[str], shares: pd.Series, title: str, path: Path)
     plt.close(fig)
 
 
+def save_degree_distribution_dual_panel(driver_dist: pd.DataFrame, vehicle_dist: pd.DataFrame) -> None:
+    panels = [
+        (
+            vehicle_dist["VEHICLE_DEGREE_GROUP"].astype(str).tolist(),
+            vehicle_dist["SHARE"],
+            "Vehicle-degree distribution",
+        ),
+        (
+            driver_dist["DRIVER_DEGREE"].astype(str).tolist(),
+            driver_dist["SHARE"],
+            "Driver-degree distribution",
+        ),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.4, 4.2), sharey=True, constrained_layout=True)
+    for ax, (labels, shares, title) in zip(axes, panels):
+        percentages = shares.astype(float) * 100
+        bars = ax.bar(labels, percentages, color="#4C78A8")
+        ax.set_title(title)
+        ax.set_xlabel("")
+        ax.set_ylim(0, 100)
+        ax.grid(axis="y", color="#D9D9D9", linewidth=0.8)
+        ax.set_axisbelow(True)
+        for bar, value in zip(bars, percentages):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f"{value:.1f}%",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+    fig.supylabel("Sample percentage")
+    fig.savefig(DEGREE_DUAL_PANEL_FIGURE_PATH, dpi=200)
+    plt.close(fig)
+
+
 def validate_household_cell_distribution(cells: pd.DataFrame, cell_dist: pd.DataFrame) -> int:
     require_columns(
         cells.columns,
@@ -704,18 +738,7 @@ def write_outputs(
     vehicle_dist.to_csv(VEHICLE_DISTRIBUTION_PATH, index=False)
     cell_dist.to_csv(HOUSEHOLD_CELL_DISTRIBUTION_PATH, index=False)
 
-    save_bar_chart(
-        driver_dist["DRIVER_DEGREE"].astype(str).tolist(),
-        driver_dist["SHARE"],
-        "Driver-degree distribution",
-        DRIVER_FIGURE_PATH,
-    )
-    save_bar_chart(
-        vehicle_dist["VEHICLE_DEGREE_GROUP"].astype(str).tolist(),
-        vehicle_dist["SHARE"],
-        "Vehicle-degree distribution",
-        VEHICLE_FIGURE_PATH,
-    )
+    save_degree_distribution_dual_panel(driver_dist, vehicle_dist)
     create_household_figures(cells, cell_dist, eligible_household_count)
 
 
@@ -725,28 +748,58 @@ def print_distribution(title: str, df: pd.DataFrame) -> None:
 
 
 def create_new_figures_from_existing_outputs(started: float) -> None:
-    assert_no_outputs_exist(NEW_FIGURE_PATHS)
     ensure_output_dirs()
 
     print("EXISTING OUTPUT MODE")
-    print("Original CSV and PNG outputs already exist; reading them to create only the two new figures.")
-    print(f"Using household cells: {HOUSEHOLD_CELL_PATH.relative_to(ROOT)}")
-    print(f"Using household cell distribution: {HOUSEHOLD_CELL_DISTRIBUTION_PATH.relative_to(ROOT)}")
+    print("Original analytical outputs already exist; reading existing CSV outputs to refresh figures.")
+    print(f"Using driver-degree distribution: {DRIVER_DISTRIBUTION_PATH.relative_to(ROOT)}")
+    print(f"Using vehicle-degree distribution: {VEHICLE_DISTRIBUTION_PATH.relative_to(ROOT)}")
 
-    cells = read_csv_strings(HOUSEHOLD_CELL_PATH)
-    cell_dist = read_csv_strings(HOUSEHOLD_CELL_DISTRIBUTION_PATH)
-    eligible_household_count = len(eligible_households_from_trips())
-    classifiable_households, _households_without_edge = create_household_figures(
-        cells, cell_dist, eligible_household_count
-    )
+    driver_dist = read_csv_strings(DRIVER_DISTRIBUTION_PATH)
+    vehicle_dist = read_csv_strings(VEHICLE_DISTRIBUTION_PATH)
+    save_degree_distribution_dual_panel(driver_dist, vehicle_dist)
+
+    household_figures_exist = [
+        HOUSEHOLD_CELL_FIGURE_PATH.exists(),
+        HOUSEHOLD_COVERAGE_FIGURE_PATH.exists(),
+    ]
+    household_figures_created = False
+    if all(household_figures_exist):
+        print("Household figures already exist; leaving them unchanged.")
+    elif any(household_figures_exist):
+        existing = [
+            path for path in [HOUSEHOLD_CELL_FIGURE_PATH, HOUSEHOLD_COVERAGE_FIGURE_PATH] if path.exists()
+        ]
+        missing = [
+            path for path in [HOUSEHOLD_CELL_FIGURE_PATH, HOUSEHOLD_COVERAGE_FIGURE_PATH] if not path.exists()
+        ]
+        joined_existing = "\n".join(str(path) for path in existing)
+        joined_missing = "\n".join(str(path) for path in missing)
+        raise FileExistsError(
+            "Found a partial household-figure output set. Refusing to overwrite or regenerate outputs.\n"
+            f"Existing household figure outputs:\n{joined_existing}\n"
+            f"Missing household figure outputs:\n{joined_missing}"
+        )
+    else:
+        print(f"Using household cells: {HOUSEHOLD_CELL_PATH.relative_to(ROOT)}")
+        print(f"Using household cell distribution: {HOUSEHOLD_CELL_DISTRIBUTION_PATH.relative_to(ROOT)}")
+        cells = read_csv_strings(HOUSEHOLD_CELL_PATH)
+        cell_dist = read_csv_strings(HOUSEHOLD_CELL_DISTRIBUTION_PATH)
+        create_household_figures(cells, cell_dist, EXPECTED_ELIGIBLE_HOUSEHOLDS)
+        household_figures_created = True
 
     print("\nFINAL SUMMARY")
-    print("Created:")
-    print(f"{HOUSEHOLD_CELL_FIGURE_PATH.relative_to(ROOT)}")
-    print(f"{HOUSEHOLD_COVERAGE_FIGURE_PATH.relative_to(ROOT)}")
-    print(f"Four-cell denominator: {classifiable_households:,}")
-    print(f"Observation-coverage denominator: {eligible_household_count:,}")
-    print(f"\nWrote new figures in {perf_counter() - started:.1f} seconds.")
+    print("Regenerated:")
+    print(f"{DEGREE_DUAL_PANEL_FIGURE_PATH.relative_to(ROOT)}")
+    if household_figures_created:
+        print("Created:")
+        print(f"{HOUSEHOLD_CELL_FIGURE_PATH.relative_to(ROOT)}")
+        print(f"{HOUSEHOLD_COVERAGE_FIGURE_PATH.relative_to(ROOT)}")
+    elif all(household_figures_exist):
+        print("Unchanged:")
+        print(f"{HOUSEHOLD_CELL_FIGURE_PATH.relative_to(ROOT)}")
+        print(f"{HOUSEHOLD_COVERAGE_FIGURE_PATH.relative_to(ROOT)}")
+    print(f"\nUpdated figure outputs in {perf_counter() - started:.1f} seconds.")
 
 
 def main() -> None:
