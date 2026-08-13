@@ -11,11 +11,11 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PROCESSED = ROOT / "data_processed"
 
-TRIPS_PATH = DATA_PROCESSED / "trips_selected_raw.csv"
-CARS_PATH = DATA_PROCESSED / "cars_selected_raw.csv"
+TRIPS_PATH = DATA_PROCESSED / "selected_raw" / "trips_selected_raw.csv"
+CARS_PATH = DATA_PROCESSED / "selected_raw" / "cars_selected_raw.csv"
 
-OUT_TRIPS_PATH = DATA_PROCESSED / "trips_home_chain_enriched.csv"
-OUT_QA_PATH = DATA_PROCESSED / "phase1_QA_summary.csv"
+OUT_TRIPS_PATH = DATA_PROCESSED / "reconstruction" / "phase1" / "trips_home_chain_enriched.csv"
+OUT_QA_PATH = DATA_PROCESSED / "reconstruction" / "phase1" / "phase1_QA_summary.csv"
 
 EXPECTED_A_IDS = {1, 2, 3}
 TIME_MISSING_STRINGS = {"", "nan", "NaN", "NA", "N/A", "None"}

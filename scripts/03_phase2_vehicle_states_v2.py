@@ -12,16 +12,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PROCESSED = ROOT / "data_processed"
 
-TRIPS_PATH = DATA_PROCESSED / "trips_home_chain_enriched.csv"
-CARS_PATH = DATA_PROCESSED / "cars_selected_raw.csv"
+TRIPS_PATH = DATA_PROCESSED / "reconstruction" / "phase1" / "trips_home_chain_enriched.csv"
+CARS_PATH = DATA_PROCESSED / "selected_raw" / "cars_selected_raw.csv"
 
-OLD_EVENTS_PATH = DATA_PROCESSED / "vehicle_events.csv"
-OLD_OCCASIONS_PATH = DATA_PROCESSED / "vehicle_choice_occasions_all.csv"
-OLD_QA_PATH = DATA_PROCESSED / "phase2_QA_summary.csv"
 
-OUT_EVENTS_PATH = DATA_PROCESSED / "vehicle_events_v2.csv"
-OUT_OCCASIONS_PATH = DATA_PROCESSED / "vehicle_choice_occasions_all_v2.csv"
-OUT_QA_PATH = DATA_PROCESSED / "phase2_QA_summary_v2.csv"
+OUT_EVENTS_PATH = DATA_PROCESSED /"reconstruction"/"phase2"/"vehicle_events_v2.csv"
+OUT_OCCASIONS_PATH = DATA_PROCESSED / "reconstruction" / "phase2" / "vehicle_choice_occasions_all_v2.csv"
+OUT_QA_PATH = DATA_PROCESSED / "reconstruction" / "phase2" / "phase2_QA_summary_v2.csv"
 
 VALID_A_IDS = {1, 2, 3}
 STATE_HOME = "HOME"
@@ -766,7 +763,6 @@ def build_qa_summary(
     initial_states: pd.DataFrame,
     first_event_violations: pd.DataFrame,
     stage_times: dict[str, float],
-    old_comparison: dict[str, int],
 ) -> pd.DataFrame:
     rbw_counts = rbw_descriptive_counts(trips, set(occasions["H_ID"].astype(str)) if not occasions.empty else set())
     rbw_pkw_hids = set(
@@ -803,53 +799,10 @@ def build_qa_summary(
         ("rbW-Pkw-unresolved occasions", int(occasions["H_ID"].astype(str).isin(rbw_pkw_hids).sum()), max(len(occasions), 1)),
         *[(key, value, max(value, 1)) for key, value in rbw_counts.items()],
         *[(f"runtime {key} seconds", int(round(value)), max(int(round(value)), 1)) for key, value in stage_times.items()],
-        *[(f"old {key}", value, max(value, 1)) for key, value in old_comparison.items()],
     ]
     return pd.DataFrame(
         [{"metric": metric, "count": int(count), "share": count / denominator} for metric, count, denominator in metrics]
     )
-
-
-def old_counts() -> dict[str, int]:
-    counts: dict[str, int] = {}
-    if OLD_OCCASIONS_PATH.exists():
-        old = pd.read_csv(OLD_OCCASIONS_PATH, dtype=str, keep_default_na=False)
-        counts["total home-origin occasions"] = len(old)
-        counts["invalid snapshot cases"] = int(integer_series(old.get("invalid_choice_snapshot_time_flag", pd.Series([], dtype=str))).sum())
-        counts["true availability conflicts"] = int(integer_series(old["availability_conflict_flag"]).sum())
-        counts["unknown snapshot occasions"] = int(integer_series(old["unknown_vehicle_state_at_snapshot_flag"]).sum())
-        counts["household-time-unresolved occasions"] = int(integer_series(old.get("vehicle_time_history_unresolved_flag", pd.Series([], dtype=str))).sum())
-        counts["overlap occasions"] = 0
-        counts["location-transition-conflict occasions"] = 0
-        counts["rbW-Pkw-unresolved occasions"] = 0
-        counts["simultaneous departures"] = int(integer_series(old["simultaneous_home_departure_flag"]).sum())
-    return counts
-
-
-def comparison_rows(old: dict[str, int], occasions: pd.DataFrame, selected: pd.DataFrame, stage_times: dict[str, float], trips: pd.DataFrame) -> pd.DataFrame:
-    rbw_pkw_hids = set(trips.loc[trips["W_RBW_NUM"].eq(1) & trips["W_VM_G_NUM"].eq(1), "H_ID"].astype(str))
-    new = {
-        "total home-origin occasions": len(occasions),
-        "invalid snapshot cases": int(occasions["invalid_snapshot_flag"].sum()),
-        "true availability conflicts": int(occasions["availability_conflict_flag"].sum()),
-        "unknown snapshot occasions": int(occasions["unknown_vehicle_state_at_snapshot_flag"].sum()),
-        "household-time-unresolved occasions": int(occasions["household_vehicle_time_unresolved_flag"].sum()),
-        "overlap households": int(selected.loc[selected["household_vehicle_trip_overlap_flag"].eq(1), "H_ID"].nunique()),
-        "overlap occasions": int(occasions["household_vehicle_trip_overlap_flag"].sum()),
-        "location-transition-conflict households": int(selected.loc[selected["household_vehicle_location_transition_conflict_flag"].eq(1), "H_ID"].nunique()),
-        "location-transition-conflict occasions": int(occasions["household_vehicle_location_transition_conflict_flag"].sum()),
-        "rbW-Pkw-unresolved households": int(len(rbw_pkw_hids & set(occasions["H_ID"].astype(str)))),
-        "rbW-Pkw-unresolved occasions": int(occasions["H_ID"].astype(str).isin(rbw_pkw_hids).sum()),
-        "simultaneous departures": int(occasions["simultaneous_home_departure_flag"].sum()),
-    }
-    rows = []
-    for metric, value in new.items():
-        old_value = old.get(metric, 0)
-        rows.append({"metric": metric, "old": old_value, "v2": value, "delta": value - old_value})
-    for key, value in stage_times.items():
-        rows.append({"metric": f"runtime {key} seconds", "old": "", "v2": round(value, 2), "delta": ""})
-    return pd.DataFrame(rows)
-
 
 def assert_phase2_v2(selected: pd.DataFrame, events: pd.DataFrame, occasions: pd.DataFrame, fleet: pd.DataFrame, first_violations: pd.DataFrame) -> None:
     counts = events.groupby(["TRIP_ID", "event_type"], sort=False).size().unstack(fill_value=0)
@@ -948,9 +901,7 @@ def main() -> None:
     ).reset_index(drop=True)
     assert_phase2_v2(selected, processed_events, occasions, fleet, first_violations)
 
-    old = old_counts()
-    comparison = comparison_rows(old, occasions, selected, stage_times, trips)
-    qa = build_qa_summary(trips, selected, unmatched, processed_events, occasions, initial_states, first_violations, stage_times, old)
+    qa = build_qa_summary(trips, selected, unmatched, processed_events, occasions, initial_states, first_violations, stage_times)
 
     stage_start = perf_counter()
     processed_events.to_csv(OUT_EVENTS_PATH, index=False)
@@ -958,10 +909,6 @@ def main() -> None:
     qa.to_csv(OUT_QA_PATH, index=False)
     stage_times["CSV writing"] = perf_counter() - stage_start
     stage_times["total"] = perf_counter() - total_t0
-
-    print("\nPHASE 2 V2 BEFORE-VS-AFTER COMPARISON")
-    with pd.option_context("display.max_rows", None, "display.width", 180):
-        print(comparison_rows(old, occasions, selected, stage_times, trips).to_string(index=False))
 
     print("\nPHASE 2 V2 QA SUMMARY")
     with pd.option_context("display.max_rows", None, "display.width", 180):

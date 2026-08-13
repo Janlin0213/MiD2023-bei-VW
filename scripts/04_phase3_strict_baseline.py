@@ -11,16 +11,16 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PROCESSED = ROOT / "data_processed"
 
-OCCASIONS_PATH = DATA_PROCESSED / "vehicle_choice_occasions_all_v2.csv"
-TRIPS_PATH = DATA_PROCESSED / "trips_home_chain_enriched.csv"
-CARS_PATH = DATA_PROCESSED / "cars_selected_raw.csv"
-PHASE1_QA_PATH = DATA_PROCESSED / "phase1_QA_summary.csv"
-PHASE2_QA_PATH = DATA_PROCESSED / "phase2_QA_summary_v2.csv"
+OCCASIONS_PATH = DATA_PROCESSED / "reconstruction" /"phase2"/ "vehicle_choice_occasions_all_v2.csv"
+TRIPS_PATH = DATA_PROCESSED / "reconstruction" /"phase1"/ "trips_home_chain_enriched.csv"
+CARS_PATH = DATA_PROCESSED /"selected_raw" / "cars_selected_raw.csv"
+PHASE1_QA_PATH = DATA_PROCESSED / "reconstruction" /"phase1"/"phase1_QA_summary.csv"
+PHASE2_QA_PATH = DATA_PROCESSED / "reconstruction" /"phase2"/"phase2_QA_summary_v2.csv"
 
-CLASSIFIED_PATH = DATA_PROCESSED / "vehicle_choice_occasions_classified.csv"
-FUNNEL_PATH = DATA_PROCESSED / "phase3_sample_funnel.csv"
-WIDE_PATH = DATA_PROCESSED / "mnl_vehicle_choice_wide_base.csv"
-QA_PATH = DATA_PROCESSED / "vehicle_availability_QA_summary.csv"
+CLASSIFIED_PATH = DATA_PROCESSED /"reconstruction" /"phase3"/ "vehicle_choice_occasions_classified.csv"
+FUNNEL_PATH = DATA_PROCESSED / "reconstruction" /"phase3"/ "phase3_sample_funnel.csv"
+WIDE_PATH = DATA_PROCESSED / "reconstruction" /"phase3"/ "mnl_vehicle_choice_wide_base.csv"
+QA_PATH = DATA_PROCESSED / "reconstruction" /"phase3"/ "vehicle_availability_QA_summary.csv"
 
 VALID_A_IDS = {1, 2, 3}
 EXPECTED_ALL_OCCASIONS = 56_340

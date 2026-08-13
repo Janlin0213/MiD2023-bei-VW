@@ -10,7 +10,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "data_raw"
-OUT_DIR = ROOT / "data_processed"
+OUT_DIR = ROOT / "data_processed"/ "selected_raw"
 SELECTED_LIST_PATH = ROOT / "metadata" / "selected raw list.py"
 
 ID_COLUMNS = {"H_ID", "HP_ID", "P_ID", "W_ID", "A_ID"}

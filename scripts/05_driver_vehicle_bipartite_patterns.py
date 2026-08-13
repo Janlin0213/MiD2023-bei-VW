@@ -14,27 +14,88 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
 DATA_PROCESSED = ROOT / "data_processed"
-RESULTS = ROOT / "results"
-FIGURES = ROOT / "figures"
+OUTPUTS = ROOT / "outputs"
 
-EVENTS_PATH = DATA_PROCESSED / "vehicle_events_v2.csv"
-TRIPS_PATH = DATA_PROCESSED / "trips_home_chain_enriched.csv"
-CARS_PATH = DATA_PROCESSED / "cars_selected_raw.csv"
-PERSONS_PATH = DATA_PROCESSED / "persons_selected_raw.csv"
+# -----------------------------
+# Canonical processed-data dirs
+# -----------------------------
+SELECTED_RAW_DIR = DATA_PROCESSED / "selected_raw"
 
-EDGE_PATH = DATA_PROCESSED / "driver_vehicle_binary_edges.csv"
-DRIVER_DEGREE_PATH = DATA_PROCESSED / "driver_degrees.csv"
-VEHICLE_DEGREE_PATH = DATA_PROCESSED / "vehicle_degrees.csv"
-HOUSEHOLD_CELL_PATH = DATA_PROCESSED / "household_mapping_cells.csv"
+RECONSTRUCTION_DIR = DATA_PROCESSED / "reconstruction"
+PHASE1_DIR = RECONSTRUCTION_DIR / "phase1"
+PHASE2_DIR = RECONSTRUCTION_DIR / "phase2"
 
-DRIVER_DISTRIBUTION_PATH = RESULTS / "driver_degree_distribution.csv"
-VEHICLE_DISTRIBUTION_PATH = RESULTS / "vehicle_degree_distribution.csv"
-HOUSEHOLD_CELL_DISTRIBUTION_PATH = RESULTS / "household_mapping_cell_distribution.csv"
+BIPARTITE_DATA_DIR = DATA_PROCESSED / "eda" / "bipartite"
 
-DEGREE_DUAL_PANEL_FIGURE_PATH = FIGURES / "driver_vehicle_degree_distribution_dual_panel.png"
-HOUSEHOLD_CELL_FIGURE_PATH = FIGURES / "household_mapping_cell_distribution.png"
-HOUSEHOLD_COVERAGE_FIGURE_PATH = FIGURES / "household_observation_coverage.png"
+# -----------------------------
+# Analytical outputs
+# -----------------------------
+BIPARTITE_OUTPUT_DIR = OUTPUTS / "eda" / "bipartite"
+
+
+# =============================
+# Inputs
+# =============================
+
+EVENTS_PATH = PHASE2_DIR / "vehicle_events_v2.csv"
+
+TRIPS_PATH = PHASE1_DIR / "trips_home_chain_enriched.csv"
+
+CARS_PATH = SELECTED_RAW_DIR / "cars_selected_raw.csv"
+
+PERSONS_PATH = SELECTED_RAW_DIR / "persons_selected_raw.csv"
+
+
+# =============================
+# Intermediate bipartite data
+# =============================
+
+EDGE_PATH = BIPARTITE_DATA_DIR / "driver_vehicle_binary_edges.csv"
+
+DRIVER_DEGREE_PATH = BIPARTITE_DATA_DIR / "driver_degrees.csv"
+
+VEHICLE_DEGREE_PATH = BIPARTITE_DATA_DIR / "vehicle_degrees.csv"
+
+HOUSEHOLD_CELL_PATH = BIPARTITE_DATA_DIR / "household_mapping_cells.csv"
+
+
+# =============================
+# Analytical result tables
+# =============================
+
+DRIVER_DISTRIBUTION_PATH = (
+    BIPARTITE_OUTPUT_DIR / "driver_degree_distribution.csv"
+)
+
+VEHICLE_DISTRIBUTION_PATH = (
+    BIPARTITE_OUTPUT_DIR / "vehicle_degree_distribution.csv"
+)
+
+HOUSEHOLD_CELL_DISTRIBUTION_PATH = (
+    BIPARTITE_OUTPUT_DIR / "household_mapping_cell_distribution.csv"
+)
+
+
+# =============================
+# Figures
+# =============================
+
+DEGREE_DUAL_PANEL_FIGURE_PATH = (
+    BIPARTITE_OUTPUT_DIR
+    / "driver_vehicle_degree_distribution_dual_panel.png"
+)
+
+HOUSEHOLD_CELL_FIGURE_PATH = (
+    BIPARTITE_OUTPUT_DIR
+    / "household_mapping_cell_distribution.png"
+)
+
+HOUSEHOLD_COVERAGE_FIGURE_PATH = (
+    BIPARTITE_OUTPUT_DIR
+    / "household_observation_coverage.png"
+)
 
 ORIGINAL_OUTPUT_PATHS = [
     EDGE_PATH,
@@ -158,8 +219,7 @@ def output_state() -> str:
 
 
 def ensure_output_dirs() -> None:
-    RESULTS.mkdir(parents=True, exist_ok=True)
-    FIGURES.mkdir(parents=True, exist_ok=True)
+    BIPARTITE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def eligible_households_from_trips() -> pd.Index:

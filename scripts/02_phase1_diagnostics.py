@@ -7,10 +7,10 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_PROCESSED = ROOT / "data_processed"
+DATA_PROCESSED = ROOT / "data_processed" 
 
-ENRICHED_PATH = DATA_PROCESSED / "trips_home_chain_enriched.csv"
-CARS_PATH = DATA_PROCESSED / "cars_selected_raw.csv"
+ENRICHED_PATH = DATA_PROCESSED /"reconstruction"/"phase1"/"trips_home_chain_enriched.csv"
+CARS_PATH = DATA_PROCESSED /"selected_raw"/"cars_selected_raw.csv"
 TIME_MISSING_STRINGS = {"", "nan", "NaN", "NA", "N/A", "None"}
 
 
