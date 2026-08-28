@@ -151,6 +151,7 @@ PERSON_SELECTED_COLS = [
  "mobil",
  "mobil_diff",
  "anzwege1",
+ "anzwege2",
  "anzwege3",
  "perskm1",
  "perskm2",
@@ -230,7 +231,7 @@ WEGE_SELECTED_COLS = [
 AUTOS_SELECTED_COLS = [
  "H_ID", "A_ID", "A_GEW", "M_CAR", "H_ANZAUTO",
  "A_ANTRIEB", "antrieb", "A_HALTER",
- "A_BAUJ", "bauj_gr", "A_ERWJ", "erwj_gr",
+ "A_BAUJ", "bauj_gr", "A_ERWJ", "erwj_gr", "ST_JAHR",
  "A_JAHRESFL", "jahresfl_gr",
  "A_KW", "kw_gr", "A_PS", "ps_gr",
  "seg_kba", "seg_kba_gr", "status",
