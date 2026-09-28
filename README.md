@@ -23,13 +23,34 @@ and ignored by Git. To run the Jupyter notebooks, include their optional tools:
 uv sync --group notebooks
 ```
 
-## Data boundary
+## Data and storage
 
-MiD source files are licensed inputs and are not supplied by this repository.
-Obtain authorized data separately and provide the repository-relative private
-directories described in [docs/storage_layout.md](docs/storage_layout.md).
-Cloning the Git repository alone does not provide `data_raw/`,
-`data_processed/`, or `outputs/` content.
+This repository contains source code, configuration, reproducible Python
+environment metadata, and workflow entry points. It intentionally excludes
+licensed MiD raw data, processed record-level data, and generated analytical
+outputs.
+
+Authorized users must provide private data locally in the expected project
+directories:
+
+```text
+data_raw/
+data_processed/
+```
+
+Generated analytical results are written locally to:
+
+```text
+outputs/
+```
+
+These directories are ignored by Git. The local Python environment is also not
+stored in the repository; recreate it with `uv sync`.
+
+This separation is intentional: Git/GitHub version-controls code,
+configuration, and the reproducible environment definition, while authorized
+private or VW storage holds licensed data, processed data, and analytical
+artifacts.
 
 After the authorized private data is available, run the read-only path check:
 

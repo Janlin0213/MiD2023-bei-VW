@@ -228,3 +228,6 @@ ehthumbs.db
 *.orig
 *.rej
 *.patch
+
+# Internal repository-maintenance notes
+docs/
