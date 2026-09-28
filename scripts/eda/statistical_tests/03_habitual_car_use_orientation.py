@@ -1010,38 +1010,82 @@ def save_figure_png(fig: plt.Figure, path_stem: Path) -> list[Path]:
 def plot_habitual_overall_proportion_dots(distribution: pd.DataFrame) -> list[Path]:
     data = validate_proportion_dot_distribution(distribution)
     if "cell_unweighted_n" not in data.columns:
-        raise KeyError("Overall plotting input is missing cell_unweighted_n for legend sample sizes.")
+        raise KeyError("Overall plotting input is missing cell_unweighted_n for heading sample sizes.")
     group_n = data.groupby("car_ownership_group", observed=True)["cell_unweighted_n"].agg(
         ["nunique", "first"]
     )
     if not group_n["nunique"].eq(1).all():
         raise RuntimeError("Overall cell_unweighted_n is inconsistent within a car-ownership group.")
-    legend_labels = {}
+    group_counts = {}
     for car_group in CAR_ORDER:
         value = numeric(pd.Series([group_n.loc[car_group, "first"]])).iloc[0]
         if not np.isfinite(value) or value <= 0 or not float(value).is_integer():
             raise RuntimeError(f"Invalid overall cell_unweighted_n for {car_group}: {value}")
-        legend_labels[car_group] = (
-            f"Persons in {CAR_LABELS[car_group]} households (n = {int(value):,})"
-        )
-    fig, ax = plt.subplots(figsize=(9.2, 5.6))
-    draw_proportion_dot_panel(ax, data, annotate=True, show_y_labels=True)
+        group_counts[car_group] = int(value)
+
+    y_positions = np.arange(len(OUTCOME_CODES))
+    shares = {
+        car_group: np.array([
+            float(data.loc[
+                data["car_ownership_group"].eq(car_group)
+                & data["P_NUTZ_AUTO"].eq(code),
+                "weighted_share",
+            ].iloc[0]) * 100.0
+            for code in OUTCOME_CODES
+        ])
+        for car_group in CAR_ORDER
+    }
+    axis_limit = int(np.ceil(max(values.max() for values in shares.values()) / 20.0) * 20)
+    axis_limit = max(axis_limit, 20)
+
+    fig, ax = plt.subplots(figsize=(9.2, 5.4), facecolor="white")
+    ax.set_facecolor("white")
+    ax.barh(y_positions, -shares["single_car"], height=0.56,
+            color=CAR_DOT_STYLES["single_car"]["color"], zorder=2)
+    ax.barh(y_positions, shares["multi_car"], height=0.56,
+            color=CAR_DOT_STYLES["multi_car"]["color"], zorder=2)
+
+    for car_group in CAR_ORDER:
+        left_side = car_group == "single_car"
+        for y_value, value in zip(y_positions, shares[car_group]):
+            inside = value >= 15.0
+            x_value = (-value + 1.7 if inside else -value - 1.2) if left_side else (
+                value - 1.7 if inside else value + 1.2
+            )
+            alignment = ("left" if inside else "right") if left_side else (
+                "right" if inside else "left"
+            )
+            ax.text(x_value, y_value, f"{value:.1f}%", ha=alignment, va="center",
+                    fontsize=9.2, fontweight="bold",
+                    color="white" if inside else CAR_DOT_STYLES[car_group]["color"],
+                    zorder=4)
+
     ax.set_title(
         "Habitual car-use frequency by household car ownership",
         loc="left",
         fontsize=13,
         fontweight="bold",
+        pad=54,
     )
+    for car_group, side in [("single_car", -1), ("multi_car", 1)]:
+        ax.text(side * axis_limit / 2, 1.055,
+                f"{CAR_LABELS[car_group]} households (n = {group_counts[car_group]:,})",
+                transform=ax.get_xaxis_transform(), ha="center", va="bottom",
+                fontsize=10.5, fontweight="bold",
+                color=CAR_DOT_STYLES[car_group]["color"])
+    ax.set_xlim(-axis_limit, axis_limit)
+    ax.set_ylim(len(OUTCOME_CODES) - 0.5, -0.5)
+    ax.set_yticks(y_positions, [OUTCOME_LABELS[code] for code in OUTCOME_CODES])
+    ax.set_xticks(np.arange(-axis_limit, axis_limit + 1, 20))
+    ax.xaxis.set_major_formatter(lambda value, _: f"{abs(value):.0f}%")
     ax.set_xlabel("Weighted share of persons (%)", labelpad=8)
-    ax.set_ylabel("Habitual car-use frequency", labelpad=10)
-    fig.legend(
-        handles=dot_legend_handles(legend_labels),
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.01),
-        ncol=2,
-        frameon=False,
-    )
-    fig.subplots_adjust(left=0.25, right=0.98, top=0.90, bottom=0.22)
+    ax.grid(axis="x", color="#DFE3E6", linewidth=0.7)
+    ax.set_axisbelow(True)
+    ax.axvline(0, color="#69747C", linewidth=1.1, zorder=3)
+    ax.spines[:].set_visible(False)
+    ax.tick_params(axis="y", length=0, labelsize=10)
+    ax.tick_params(axis="x", length=0, colors="#404040", labelsize=9)
+    fig.subplots_adjust(left=0.26, right=0.98, top=0.77, bottom=0.13)
     return save_figure_png(fig, OUTPUT_DIR / PROPORTION_DOT_FILENAMES["overall"])
 
 

@@ -75,6 +75,8 @@ TOUR_CONTEXT_COLUMNS = [
     "W_ANZBEGL",
     "HOUSEHOLD_ACCOMPANIED",
     "P_STWETTER",
+    "TOUR_WORST_XMSTADT_ZO",
+    "TOUR_WORST_QUALI_OPNV_ZO",
 ]
 
 HOUSEHOLD_COLUMNS = [
@@ -115,7 +117,11 @@ VEHICLE_COLUMNS = [
     "STATUS_2",
 ]
 
-ADDITIVE_VEHICLE_COLUMNS = ["HOLDER_1", "HOLDER_2", "STATUS_1", "STATUS_2"]
+OLD_DESTINATION_CONTEXT_COLUMNS = ["XMStadt_ZO", "quali_opnv_zo"]
+TOUR_DESTINATION_CONTEXT_COLUMNS = [
+    "TOUR_WORST_XMSTADT_ZO",
+    "TOUR_WORST_QUALI_OPNV_ZO",
+]
 
 PREFERRED_FINAL_COLUMNS = [
     *ESTIMATION_COLUMNS,
@@ -140,6 +146,7 @@ BACKBONE_TOUR_SOURCE_COLUMNS = [
     "TOUR_HAS_LEISURE",
     "TOUR_HAS_ESCORT",
     "TOUR_HAS_OTHER_PURPOSE",
+    *TOUR_DESTINATION_CONTEXT_COLUMNS,
 ]
 
 TRIP_SOURCE_COLUMNS = [
@@ -283,7 +290,7 @@ def read_csv_strings(path: Path, usecols: list[str] | None = None) -> pd.DataFra
 def load_inputs(paths: Paths) -> dict[str, pd.DataFrame]:
     if not paths.model_input.exists():
         raise FileNotFoundError(
-            "Strictly additive HOLDER/STATUS update requires the accepted existing model input: "
+            "Controlled destination-context replacement requires the accepted existing model input: "
             f"{paths.model_input}"
         )
     backbone_columns = list(dict.fromkeys([*ESTIMATION_COLUMNS, *BACKBONE_TOUR_SOURCE_COLUMNS]))
@@ -439,7 +446,7 @@ def canonicalize_candidate_registry(path: Path) -> list[dict[str, str]]:
         {"final": "HOLDER_1/2", "selected": "A_HALTER", "dropped": "none", "reason": "optional alternative-specific holder type with documented non-substantive codes set missing"},
         {"final": "STATUS_1/2", "selected": "status", "dropped": "none", "reason": "optional analytical vehicle representation derived from KBA segment and construction year; do not automatically combine with SEGMENT + VEHICLE_AGE"},
         {"final": "baseline route/OD", "selected": "none", "dropped": "auto_dist, auto_dauer, rad_dist, rad_dauer, opnv_dist, opnv_dauer_*", "reason": "deferred extension overlaps tour scale"},
-        {"final": "baseline trip spatial", "selected": "household/home context", "dropped": "*_SO, *_ZO, RegioStaRGem7, RegioStaRGem5", "reason": "home-origin baseline uses household spatial context"},
+        {"final": "destination spatial context", "selected": "TOUR_WORST_XMSTADT_ZO + TOUR_WORST_QUALI_OPNV_ZO", "dropped": "XMStadt_ZO + quali_opnv_zo; *_SO; other *_ZO; RegioStaRGem7; RegioStaRGem5", "reason": "tour-level destination context is more consistent with the home-based-tour choice unit while retaining the already validated Phase 4 worst-observed aggregation"},
     ]
 
 
@@ -468,6 +475,12 @@ def select_tour_features(backbone: pd.DataFrame) -> pd.DataFrame:
         "TOUR_HAS_OTHER_PURPOSE",
     ]:
         out[column] = valid_integer(backbone[column], [0, 1])
+    out["TOUR_WORST_XMSTADT_ZO"] = valid_integer(
+        backbone["TOUR_WORST_XMSTADT_ZO"], range(1, 7)
+    )
+    out["TOUR_WORST_QUALI_OPNV_ZO"] = valid_integer(
+        backbone["TOUR_WORST_QUALI_OPNV_ZO"], range(1, 5)
+    )
     return out
 
 
@@ -612,7 +625,12 @@ def merge_features(
     merged["_STRICT_ROW_ORDER"] = np.arange(len(merged), dtype=np.int64)
     for column in tour.columns:
         if column != "START_MIN":
-            merged[column] = tour[column].to_numpy()
+            values = (
+                tour[column].array
+                if column in TOUR_DESTINATION_CONTEXT_COLUMNS
+                else tour[column].to_numpy()
+            )
+            merged[column] = values
 
     merged = merged.merge(trip, on="SOURCE_ROW_ID", how="left", validate="one_to_one", sort=False)
     merged = merged.merge(household, on="H_ID", how="left", validate="many_to_one", sort=False)
@@ -662,6 +680,8 @@ def validate_missing_codes(frame: pd.DataFrame) -> None:
         "TOUR_HAS_OTHER_PURPOSE": {0, 1},
         "HOUSEHOLD_ACCOMPANIED": {0, 1},
         "P_STWETTER": {1, 2, 3, 4, 5, 6},
+        "TOUR_WORST_XMSTADT_ZO": {1, 2, 3, 4, 5, 6},
+        "TOUR_WORST_QUALI_OPNV_ZO": {1, 2, 3, 4},
         "hhgr_gr": {1, 2, 3, 4, 5},
         "H_MIETE": {1, 2, 3},
         "oek_status": {1, 2, 3, 4, 5},
@@ -705,47 +725,84 @@ def drop_constant_features(frame: pd.DataFrame) -> tuple[list[str], list[str]]:
     return final_columns, excluded
 
 
-def validate_additive_update(previous: pd.DataFrame, final: pd.DataFrame) -> dict[str, object]:
-    existing_columns = [
-        column for column in previous.columns if column not in ADDITIVE_VEHICLE_COLUMNS
-    ]
-    expected_columns = [*existing_columns, *ADDITIVE_VEHICLE_COLUMNS]
-    if list(final.columns) != expected_columns:
+def validate_controlled_replacement(previous: pd.DataFrame, final: pd.DataFrame) -> dict[str, object]:
+    previous_columns = list(previous.columns)
+    final_columns = list(final.columns)
+    missing_old = [column for column in OLD_DESTINATION_CONTEXT_COLUMNS if column not in previous_columns]
+    if missing_old:
         raise AssertionError(
-            "Strict additive column order failed: expected all accepted columns unchanged "
-            "followed by HOLDER_1/2 and STATUS_1/2."
+            "Accepted reference model input lacks destination-context column(s) required for replacement: "
+            f"{missing_old}."
         )
+    retained_columns = [
+        column for column in previous_columns if column not in OLD_DESTINATION_CONTEXT_COLUMNS
+    ]
+    old_position = previous_columns.index(OLD_DESTINATION_CONTEXT_COLUMNS[0])
+    if previous_columns[old_position : old_position + 2] != OLD_DESTINATION_CONTEXT_COLUMNS:
+        raise AssertionError("Accepted first-destination columns are not adjacent in their canonical position.")
+
+    expected_columns = [
+        *previous_columns[:old_position],
+        *TOUR_DESTINATION_CONTEXT_COLUMNS,
+        *previous_columns[old_position + len(OLD_DESTINATION_CONTEXT_COLUMNS) :],
+    ]
+    removed_columns = [column for column in previous_columns if column not in final_columns]
+    added_columns = [column for column in final_columns if column not in previous_columns]
+    if removed_columns != OLD_DESTINATION_CONTEXT_COLUMNS:
+        raise AssertionError(
+            f"Controlled replacement removed unexpected columns: {removed_columns}."
+        )
+    if added_columns != TOUR_DESTINATION_CONTEXT_COLUMNS:
+        raise AssertionError(
+            f"Controlled replacement introduced unexpected columns: {added_columns}."
+        )
+    if any(column in final_columns for column in OLD_DESTINATION_CONTEXT_COLUMNS):
+        raise AssertionError("Final model input still contains the replaced first-destination variables.")
+    if any(column not in final_columns for column in TOUR_DESTINATION_CONTEXT_COLUMNS):
+        raise AssertionError("Final model input lacks a required tour-level destination-context variable.")
+    if final_columns != expected_columns:
+        raise AssertionError(
+            "Controlled replacement must preserve column order and substitute only the destination-context pair."
+        )
+    if [column for column in final_columns if column not in TOUR_DESTINATION_CONTEXT_COLUMNS] != retained_columns:
+        raise AssertionError("Pre-existing retained columns changed order during controlled replacement.")
     if len(final) != len(previous):
-        raise AssertionError("Strict additive update changed the accepted row count.")
-    for column in existing_columns:
+        raise AssertionError("Controlled replacement changed the accepted row count.")
+
+    for column in retained_columns:
         before = previous[column].astype("string").fillna("").reset_index(drop=True)
         after = final[column].astype("string").fillna("").reset_index(drop=True)
         if not after.equals(before):
             mismatch = after.ne(before)
             first_position = int(mismatch[mismatch].index[0])
             raise AssertionError(
-                f"Strict additive update changed accepted column {column} at row "
-                f"position {first_position}."
+                f"Controlled replacement changed accepted column {column} at row position {first_position}."
             )
     if previous["CHOICE_ID"].nunique() != final["CHOICE_ID"].nunique():
-        raise AssertionError("Strict additive update changed the unique CHOICE_ID count.")
+        raise AssertionError("Controlled replacement changed the unique CHOICE_ID count.")
     if previous["H_ID"].nunique() != final["H_ID"].nunique():
-        raise AssertionError("Strict additive update changed the household count.")
+        raise AssertionError("Controlled replacement changed the household count.")
     if previous["HP_ID"].nunique() != final["HP_ID"].nunique():
-        raise AssertionError("Strict additive update changed the person count.")
+        raise AssertionError("Controlled replacement changed the person count.")
     before_choice_distribution = previous["CHOICE"].value_counts(dropna=False).sort_index()
     after_choice_distribution = final["CHOICE"].astype("string").value_counts(dropna=False).sort_index()
     if not before_choice_distribution.equals(after_choice_distribution):
-        raise AssertionError("Strict additive update changed the CHOICE distribution.")
+        raise AssertionError("Controlled replacement changed the CHOICE distribution.")
     return {
         "rows_before": len(previous),
         "rows_after": len(final),
-        "columns_before": len(existing_columns),
-        "columns_after": len(final.columns),
+        "columns_before": len(previous_columns),
+        "columns_after": len(final_columns),
         "unique_choice_id_before": previous["CHOICE_ID"].nunique(),
         "unique_choice_id_after": final["CHOICE_ID"].nunique(),
-        "existing_column_count": len(existing_columns),
+        "households_before": previous["H_ID"].nunique(),
+        "households_after": final["H_ID"].nunique(),
+        "persons_before": previous["HP_ID"].nunique(),
+        "persons_after": final["HP_ID"].nunique(),
+        "existing_column_count": len(retained_columns),
         "existing_column_equality": "PASS",
+        "removed_columns": ", ".join(removed_columns),
+        "added_columns": ", ".join(added_columns),
     }
 
 
@@ -809,6 +866,30 @@ def _manifest_catalog() -> dict[str, dict[str, str]]:
     add("W_ANZBEGL", "departure", trips, "W_ANZBEGL", "retain documented direct count", "departure accompaniment", "integer 0--25 (25=25 or more)", "99 and 701 become blank", "direct count at vehicle-selection moment", "anzbegl; anzpers")
     add("HOUSEHOLD_ACCOMPANIED", "departure", trips, "W_BEGL_HH", "1->1; 2 or documented no-accompaniment 716->0", "household accompaniment", "0 no household companion; 1 household companion", "9/202/701/717/995 become blank", "distinct from total accompaniment count")
     add("P_STWETTER", "departure", trips, "P_STWETTER", "documented weather codes retained", "weather context", "1 sunny; 2 lightly cloudy; 3 changeable; 4 overcast; 5 rainy; 6 snow", "9 and proxy code 210 become blank", "single reporting-day weather representation")
+    add(
+        "TOUR_WORST_XMSTADT_ZO",
+        "tour destination",
+        backbone,
+        "TOUR_WORST_XMSTADT_ZO",
+        "copy accepted Phase 4 maximum valid minute-city category among observed non-home destinations; retain integer codes 1--6",
+        "worst-observed tour destination urban structure",
+        "1 five-minute through 6 sixty-minute/other; calculated when at least one valid non-home destination exists",
+        "missing otherwise; retain missing without imputation or row filtering",
+        "tour-level destination context is consistent with the home-based-tour choice unit; worst-observed aggregation uses additional observed tour destinations and is not missing-value imputation",
+        "XMStadt_ZO",
+    )
+    add(
+        "TOUR_WORST_QUALI_OPNV_ZO",
+        "tour destination",
+        backbone,
+        "TOUR_WORST_QUALI_OPNV_ZO",
+        "copy accepted Phase 4 minimum valid PT-quality category among observed non-home destinations; retain integer codes 1--4",
+        "worst-observed tour destination public transport quality",
+        "1 very poor through 4 very good; calculated when at least one valid non-home destination exists",
+        "missing otherwise; retain missing without imputation or row filtering",
+        "tour-level destination context is consistent with the home-based-tour choice unit; worst-observed aggregation uses additional observed tour destinations and is not missing-value imputation",
+        "quali_opnv_zo",
+    )
 
     add("household_type", "household", f"{households}; {persons}", "household_type or accepted aggregation of alter_gr5", "reuse src/build_household_type.py in memory when selected household file lacks the stored field", "household life stage", "family_household; young_household; adult_household; senior_household", "unknown becomes blank; rows retained", "validated thesis construct", "H_GR; HP_ALTER_1--6")
     add("hhgr_gr", "household", households, "hhgr_gr", "documented codes retained", "household size", "1,2,3,4,5 persons or more", "other codes become blank", "distinct size construct from household_type", "H_GR")
@@ -916,7 +997,7 @@ def build_QA_summary(
     merge_metrics: dict[str, int],
     canonicalization: list[dict[str, str]],
     constant_exclusions: list[str],
-    additive_comparison: dict[str, object],
+    replacement_comparison: dict[str, object],
 ) -> pd.DataFrame:
     backbone = inputs["backbone"]
     rows: list[dict[str, object]] = []
@@ -969,21 +1050,74 @@ def build_QA_summary(
 
     rows.extend(
         [
-            qa_row("ADDITIVE_UPDATE", "rows before", value=additive_comparison["rows_before"]),
-            qa_row("ADDITIVE_UPDATE", "rows after", value=additive_comparison["rows_after"]),
-            qa_row("ADDITIVE_UPDATE", "columns before", value=additive_comparison["columns_before"]),
-            qa_row("ADDITIVE_UPDATE", "columns after", value=additive_comparison["columns_after"]),
-            qa_row("ADDITIVE_UPDATE", "unique CHOICE_ID before", value=additive_comparison["unique_choice_id_before"]),
-            qa_row("ADDITIVE_UPDATE", "unique CHOICE_ID after", value=additive_comparison["unique_choice_id_after"]),
+            qa_row("CONTROLLED_REPLACEMENT", "rows before", value=replacement_comparison["rows_before"]),
+            qa_row("CONTROLLED_REPLACEMENT", "rows after", value=replacement_comparison["rows_after"]),
+            qa_row("CONTROLLED_REPLACEMENT", "columns before", value=replacement_comparison["columns_before"]),
+            qa_row("CONTROLLED_REPLACEMENT", "columns after", value=replacement_comparison["columns_after"]),
+            qa_row("CONTROLLED_REPLACEMENT", "unique CHOICE_ID before", value=replacement_comparison["unique_choice_id_before"]),
+            qa_row("CONTROLLED_REPLACEMENT", "unique CHOICE_ID after", value=replacement_comparison["unique_choice_id_after"]),
+            qa_row("CONTROLLED_REPLACEMENT", "households before", value=replacement_comparison["households_before"]),
+            qa_row("CONTROLLED_REPLACEMENT", "households after", value=replacement_comparison["households_after"]),
+            qa_row("CONTROLLED_REPLACEMENT", "persons before", value=replacement_comparison["persons_before"]),
+            qa_row("CONTROLLED_REPLACEMENT", "persons after", value=replacement_comparison["persons_after"]),
             qa_row(
-                "ADDITIVE_UPDATE",
-                "existing-column equality check",
-                variable=str(additive_comparison["existing_column_count"]),
-                value=additive_comparison["existing_column_equality"],
+                "CONTROLLED_REPLACEMENT",
+                "only removed columns",
+                variable=replacement_comparison["removed_columns"],
+                value="PASS",
+                details="Removed only the accepted first-destination representation.",
+            ),
+            qa_row(
+                "CONTROLLED_REPLACEMENT",
+                "only added columns",
+                variable=replacement_comparison["added_columns"],
+                value="PASS",
+                details="Replaced the old pair in place after P_STWETTER.",
+            ),
+            qa_row(
+                "CONTROLLED_REPLACEMENT",
+                "other existing-column equality check",
+                variable=str(replacement_comparison["existing_column_count"]),
+                value=replacement_comparison["existing_column_equality"],
                 details="Every pre-existing column compared row-for-row in its accepted order.",
             ),
         ]
     )
+
+    for column in TOUR_DESTINATION_CONTEXT_COLUMNS:
+        valid_count = int(final[column].notna().sum())
+        missing_count = int(final[column].isna().sum())
+        rows.extend(
+            [
+                qa_row(
+                    "DESTINATION_CONTEXT_REPLACEMENT",
+                    "valid count",
+                    variable=column,
+                    value=valid_count,
+                    denominator=len(final),
+                    share=valid_count / len(final),
+                    details="Accepted Phase 4 worst-observed tour destination value.",
+                ),
+                qa_row(
+                    "DESTINATION_CONTEXT_REPLACEMENT",
+                    "missing count",
+                    variable=column,
+                    value=missing_count,
+                    denominator=len(final),
+                    share=missing_count / len(final),
+                    details="Missing retained as missing; no imputation and no row filtering.",
+                ),
+                qa_row(
+                    "DESTINATION_CONTEXT_REPLACEMENT",
+                    "missing share",
+                    variable=column,
+                    value=missing_count / len(final),
+                    denominator=len(final),
+                    share=missing_count / len(final),
+                    details="Denominator is the unchanged strict model-input sample.",
+                ),
+            ]
+        )
 
     for feature in ["HOLDER", "STATUS"]:
         for alternative in [1, 2]:
@@ -1071,6 +1205,7 @@ def build_QA_summary(
 
 def run_final_assertions(
     backbone: pd.DataFrame,
+    accepted_phase4_backbone: pd.DataFrame,
     merged: pd.DataFrame,
     final: pd.DataFrame,
     vehicle_wide: pd.DataFrame,
@@ -1086,6 +1221,18 @@ def run_final_assertions(
         input_values = backbone[column].astype("string").reset_index(drop=True)
         if not final_values.equals(input_values):
             raise AssertionError(f"Accepted backbone column changed: {column}")
+
+    for column, valid_codes in [
+        ("TOUR_WORST_XMSTADT_ZO", range(1, 7)),
+        ("TOUR_WORST_QUALI_OPNV_ZO", range(1, 5)),
+    ]:
+        expected = valid_integer(accepted_phase4_backbone[column], valid_codes)
+        observed_values = final[column].astype("string").reset_index(drop=True)
+        expected_values = expected.astype("string").reset_index(drop=True)
+        if not observed_values.equals(expected_values):
+            raise AssertionError(
+                f"Final {column} differs from the canonically cleaned accepted Phase 4 backbone."
+            )
 
     forbidden = []
     for column in final.columns:
@@ -1150,32 +1297,35 @@ def print_vehicle_examples(final: pd.DataFrame) -> None:
 def print_final_summary(
     paths: Paths,
     final: pd.DataFrame,
-    additive_comparison: dict[str, object],
+    replacement_comparison: dict[str, object],
 ) -> None:
-    print("\nADDITIVE HOLDER / STATUS UPDATE")
-    print(f"\nrows before: {additive_comparison['rows_before']:,}")
-    print(f"rows after: {additive_comparison['rows_after']:,}")
-    print(f"unique choices before: {additive_comparison['unique_choice_id_before']:,}")
-    print(f"unique choices after: {additive_comparison['unique_choice_id_after']:,}")
-    print(f"\ncolumns before: {additive_comparison['columns_before']:,}")
-    print(f"columns after: {additive_comparison['columns_after']:,}")
-    for feature in ["HOLDER", "STATUS"]:
-        print(f"\n{feature}:")
-        valid_1 = int(final[f"{feature}_1"].notna().sum())
-        valid_2 = int(final[f"{feature}_2"].notna().sum())
-        pair_complete = final[[f"{feature}_1", f"{feature}_2"]].notna().all(axis=1)
-        print(f"vehicle 1 valid: {valid_1:,}")
-        print(f"vehicle 2 valid: {valid_2:,}")
-        print(f"both vehicles valid: {int(pair_complete.sum()):,}")
-        print(f"both-valid share: {pair_complete.mean():.2%}")
-    print(f"\nExisting-column equality check: {additive_comparison['existing_column_equality']}")
+    print("\nCONTROLLED DESTINATION-CONTEXT REPLACEMENT")
+    print(f"\nrows before: {replacement_comparison['rows_before']:,}")
+    print(f"rows after: {replacement_comparison['rows_after']:,}")
+    print(f"unique choices before: {replacement_comparison['unique_choice_id_before']:,}")
+    print(f"unique choices after: {replacement_comparison['unique_choice_id_after']:,}")
+    print(f"households before: {replacement_comparison['households_before']:,}")
+    print(f"households after: {replacement_comparison['households_after']:,}")
+    print(f"persons before: {replacement_comparison['persons_before']:,}")
+    print(f"persons after: {replacement_comparison['persons_after']:,}")
+    print(f"\ncolumns before: {replacement_comparison['columns_before']:,}")
+    print(f"columns after: {replacement_comparison['columns_after']:,}")
+    print(f"removed columns: {replacement_comparison['removed_columns']}")
+    print(f"added columns: {replacement_comparison['added_columns']}")
+    for feature in TOUR_DESTINATION_CONTEXT_COLUMNS:
+        valid_count = int(final[feature].notna().sum())
+        print(f"\n{feature} valid: {valid_count:,}")
+        print(f"{feature} missing: {len(final) - valid_count:,}")
+        print(f"{feature} missing share: {(len(final) - valid_count) / len(final):.2%}")
+    print(f"\nOther existing-column equality check: {replacement_comparison['existing_column_equality']}")
     print("\nOUTPUTS UPDATED:")
     print(paths.model_input.resolve())
     print(paths.manifest.resolve())
     print(paths.qa.resolve())
     print(
-        "\nNo accepted reconstruction, tour logic, sample-selection logic, or existing "
-        "model-input feature was changed. Only HOLDER_1/2 and STATUS_1/2 were added."
+        "\nThe first-destination representation was replaced by the accepted Phase 4 "
+        "tour-level worst-observed representation. No reconstruction, sample-selection, "
+        "tour logic, or other model-input feature changed."
     )
 
 
@@ -1198,7 +1348,7 @@ def main() -> None:
     validate_missing_codes(merged)
     final_columns, constant_exclusions = drop_constant_features(merged)
     final = merged[final_columns].copy()
-    additive_comparison = validate_additive_update(inputs["previous_model"], final)
+    replacement_comparison = validate_controlled_replacement(inputs["previous_model"], final)
     manifest = build_manifest(final_columns)
     qa = build_QA_summary(
         inputs,
@@ -1208,15 +1358,15 @@ def main() -> None:
         merge_metrics,
         canonicalization,
         constant_exclusions,
-        additive_comparison,
+        replacement_comparison,
     )
-    run_final_assertions(backbone_invariants, merged, final, vehicle)
+    run_final_assertions(backbone_invariants, inputs["backbone"], merged, final, vehicle)
     save_outputs(paths, final, manifest, qa)
     print_vehicle_examples(final)
     print_final_summary(
         paths,
         final,
-        additive_comparison,
+        replacement_comparison,
     )
 
 

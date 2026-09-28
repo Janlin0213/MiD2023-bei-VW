@@ -53,6 +53,23 @@ PURPOSE_INDICATORS = {
     7: "TOUR_HAS_ESCORT",
 }
 
+DESTINATION_SPATIAL_SPECS = {
+    "XMStadt_ZO": {
+        "clean": "_XMSTADT_ZO",
+        "nonhome": "_NONHOME_XMSTADT_ZO",
+        "feature": "TOUR_WORST_XMSTADT_ZO",
+        "valid_codes": set(range(1, 7)),
+        "aggregation": "max",
+    },
+    "quali_opnv_zo": {
+        "clean": "_QUALI_OPNV_ZO",
+        "nonhome": "_NONHOME_QUALI_OPNV_ZO",
+        "feature": "TOUR_WORST_QUALI_OPNV_ZO",
+        "valid_codes": set(range(1, 5)),
+        "aggregation": "min",
+    },
+}
+
 # W_ZWECK 11--16 are documented detailed refinements of the summarised `zweck`
 # categories.  These are reported but are not unexpected disagreements.
 EXPECTED_PURPOSE_REFINEMENTS = {
@@ -147,6 +164,7 @@ def canonicalize_trip_attributes(trips: pd.DataFrame) -> tuple[pd.DataFrame, Rec
         "ARRIVAL_MIN",
         DISTANCE_COLUMN,
         TRAVEL_TIME_COLUMN,
+        *DESTINATION_SPATIAL_SPECS,
     ]
     require_columns(trips, required, "Phase 1")
     out = trips.copy()
@@ -174,6 +192,9 @@ def canonicalize_trip_attributes(trips: pd.DataFrame) -> tuple[pd.DataFrame, Rec
     out["_START_MIN"] = numeric(out["START_MIN"])
     out["_ARRIVAL_MIN"] = numeric(out["ARRIVAL_MIN"])
     out["_PKW_FMF"] = numeric(out["pkw_fmf"]) if "pkw_fmf" in out.columns else np.nan
+    for source, spec in DESTINATION_SPATIAL_SPECS.items():
+        raw_spatial = numeric(out[source])
+        out[spec["clean"]] = raw_spatial.where(raw_spatial.isin(spec["valid_codes"])).astype("Int64")
 
     invalid_chain_flag = ~out["_CHAIN_ELIGIBLE"].isin([0, 1])
     if invalid_chain_flag.any():
@@ -358,6 +379,8 @@ def reconstruct_home_based_tours(
 def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd.DataFrame:
     work = membership.copy()
     work["_NONHOME_STOP"] = work["_HOME_DESTINATION"].eq(0).fillna(False).astype(int)
+    for spec in DESTINATION_SPATIAL_SPECS.values():
+        work[spec["nonhome"]] = work[spec["clean"]].where(work["_NONHOME_STOP"].eq(1))
     work["_UNKNOWN_HOME_ORIGIN"] = work["_HOME_ORIGIN"].isna().astype(int)
     work["_UNKNOWN_HOME_DESTINATION"] = work["_HOME_DESTINATION"].isna().astype(int)
     broad_valid = numeric(work["BROAD_PURPOSE"]).isin(VALID_BROAD_PURPOSES)
@@ -377,6 +400,10 @@ def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd
         TOUR_CONTAINS_UNKNOWN_HOME_DESTINATION_FLAG=("_UNKNOWN_HOME_DESTINATION", "max"),
         _ANY_UNKNOWN_NONHOME_PURPOSE=("_UNKNOWN_NONHOME_PURPOSE", "max"),
         **{column: (column, "max") for column in PURPOSE_INDICATORS.values()},
+        **{
+            spec["feature"]: (spec["nonhome"], spec["aggregation"])
+            for spec in DESTINATION_SPATIAL_SPECS.values()
+        },
     ).reset_index()
     distance = grouped["TRIP_DISTANCE_KM"].sum(min_count=1).rename("TOUR_DISTANCE_KM").reset_index()
     travel_time = grouped["TRIP_TRAVEL_TIME_MIN"].sum(min_count=1).rename("TOUR_TRAVEL_TIME_MIN").reset_index()
@@ -504,6 +531,7 @@ def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd
         "TOUR_ELAPSED_TIME_MIN",
         "TOUR_N_TRIPS",
         "TOUR_N_NONHOME_STOPS",
+        *[spec["feature"] for spec in DESTINATION_SPATIAL_SPECS.values()],
         "TOUR_MULTI_STOP_FLAG",
         "TOUR_FIRST_PURPOSE",
         "TOUR_MAIN_PURPOSE",
@@ -603,6 +631,23 @@ def assert_tour_integrity(prepared: pd.DataFrame, membership: pd.DataFrame, tour
     if tours["TOUR_N_TRIPS"].lt(1).any():
         raise AssertionError("Every reconstructed tour must contain at least one observed trip.")
 
+    nonhome = membership["_HOME_DESTINATION"].eq(0).fillna(False)
+    indexed_tours = tours.set_index("TOUR_ID")
+    for spec in DESTINATION_SPATIAL_SPECS.values():
+        expected = (
+            membership[spec["clean"]]
+            .where(nonhome)
+            .groupby(membership["TOUR_ID"], sort=False)
+            .agg(spec["aggregation"])
+            .reindex(tours["TOUR_ID"])
+            .reset_index(drop=True)
+        )
+        actual = indexed_tours[spec["feature"]].reindex(tours["TOUR_ID"]).reset_index(drop=True)
+        try:
+            pd.testing.assert_series_equal(expected, actual, check_names=False, check_dtype=False)
+        except AssertionError as error:
+            raise AssertionError(f"Incorrect worst-observed aggregation for {spec['feature']}.") from error
+
 
 def merge_to_strict_wide(
     wide: pd.DataFrame,
@@ -676,6 +721,57 @@ def qa_row(section: str, metric: str, count: float | int, denominator: int | Non
         "share": share,
         "denominator_description": description,
     }
+
+
+def destination_spatial_tour_diagnostics(
+    membership: pd.DataFrame,
+    tours: pd.DataFrame,
+) -> pd.DataFrame:
+    """Derive destination coverage from accepted member trips without changing their order."""
+    ordered = membership.sort_values(
+        ["PERSON_KEY", "_CHAIN_SEQUENCE", "_W_ID_SORT", "_SOURCE_ROW_NUM", "SOURCE_ROW_ID"],
+        kind="mergesort",
+        na_position="last",
+    ).copy()
+    ordered["_NONHOME_STOP"] = ordered["_HOME_DESTINATION"].eq(0).fillna(False).astype(int)
+    nonhome = ordered.loc[ordered["_NONHOME_STOP"].eq(1)].copy()
+
+    diagnostics = tours[["TOUR_ID"]].copy()
+    tour_ids = diagnostics["TOUR_ID"]
+    observed = nonhome.groupby("TOUR_ID", sort=False).size()
+    diagnostics["_N_NONHOME_DESTINATIONS"] = tour_ids.map(observed).fillna(0).astype(int)
+
+    first_nonhome = nonhome.drop_duplicates("TOUR_ID", keep="first").set_index("TOUR_ID")
+    for source, spec in DESTINATION_SPATIAL_SPECS.items():
+        prefix = f"_{source.upper()}"
+        valid_counts = nonhome[spec["clean"]].notna().groupby(nonhome["TOUR_ID"], sort=False).sum()
+        diagnostics[f"{prefix}_N_VALID"] = tour_ids.map(valid_counts).fillna(0).astype(int)
+        diagnostics[f"{prefix}_ZERO_NONHOME"] = diagnostics["_N_NONHOME_DESTINATIONS"].eq(0)
+        diagnostics[f"{prefix}_AT_LEAST_VALID"] = diagnostics[f"{prefix}_N_VALID"].gt(0)
+        diagnostics[f"{prefix}_ALL_VALID"] = (
+            diagnostics["_N_NONHOME_DESTINATIONS"].gt(0)
+            & diagnostics[f"{prefix}_N_VALID"].eq(diagnostics["_N_NONHOME_DESTINATIONS"])
+        )
+        diagnostics[f"{prefix}_PARTIAL"] = (
+            diagnostics[f"{prefix}_N_VALID"].gt(0)
+            & diagnostics[f"{prefix}_N_VALID"].lt(diagnostics["_N_NONHOME_DESTINATIONS"])
+        )
+        diagnostics[f"{prefix}_ALL_MISSING"] = (
+            diagnostics["_N_NONHOME_DESTINATIONS"].gt(0)
+            & diagnostics[f"{prefix}_N_VALID"].eq(0)
+        )
+        first_valid = first_nonhome[spec["clean"]].notna()
+        diagnostics[f"{prefix}_FIRST_VALID"] = tour_ids.map(first_valid).eq(True)
+        diagnostics[f"{prefix}_FIRST_MISSING"] = (
+            diagnostics["_N_NONHOME_DESTINATIONS"].gt(0)
+            & ~diagnostics[f"{prefix}_FIRST_VALID"]
+        )
+        diagnostics[f"{prefix}_RESCUED"] = (
+            diagnostics[f"{prefix}_FIRST_MISSING"]
+            & diagnostics[f"{prefix}_AT_LEAST_VALID"]
+        )
+
+    return diagnostics
 
 
 def build_qa_summary(
@@ -770,6 +866,44 @@ def build_qa_summary(
     ]
     rows.extend(qa_row("MODEL-COMPARISON READINESS", label, int(mask.sum()), strict_den, "strict output rows") for label, mask in readiness)
 
+    destination_rows: list[dict[str, object]] = []
+    destination_diagnostics = destination_spatial_tour_diagnostics(membership, tours)
+    strict_destination = matched[["CHOICE_ID", "TOUR_ID"]].merge(
+        destination_diagnostics,
+        on="TOUR_ID",
+        how="left",
+        validate="one_to_one",
+    )
+    if len(strict_destination) != len(matched) or strict_destination["_N_NONHOME_DESTINATIONS"].isna().any():
+        raise AssertionError("Destination-spatial QA did not preserve all strict matched rows.")
+
+    matched_den = len(strict_destination)
+    for source, spec in DESTINATION_SPATIAL_SPECS.items():
+        prefix = f"_{source.upper()}"
+        with_nonhome = strict_destination["_N_NONHOME_DESTINATIONS"].gt(0)
+        first_missing = strict_destination[f"{prefix}_FIRST_MISSING"]
+        rescued = strict_destination[f"{prefix}_RESCUED"]
+        feature_valid = strict_destination[f"{prefix}_AT_LEAST_VALID"]
+        nonhome_den = int(with_nonhome.sum())
+        first_missing_den = int(first_missing.sum())
+        feature = spec["feature"]
+        destination_rows.extend(
+            [
+                qa_row("DESTINATION SPATIAL QA", f"{source}: strict matched tours/rows", matched_den, matched_den, "strict rows with TOUR_MATCH_FOUND == 1"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: strict rows with zero non-home destinations", int((~with_nonhome).sum()), matched_den, "strict matched rows"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: strict rows with at least one non-home destination", nonhome_den, matched_den, "strict matched rows"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: first non-home destination valid", int(strict_destination[f"{prefix}_FIRST_VALID"].sum()), nonhome_den, "strict matched rows with at least one non-home destination"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: first non-home destination missing", first_missing_den, nonhome_den, "strict matched rows with at least one non-home destination"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: {feature} valid", int(feature_valid.sum()), matched_den, "strict matched rows"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: {feature} missing", int((~feature_valid).sum()), matched_den, "strict matched rows, including zero-non-home-destination rows"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: rescued by tour aggregation", int(rescued.sum()), matched_den, "strict matched rows"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: rescued among first-destination-missing", int(rescued.sum()), first_missing_den, "strict matched rows whose first non-home destination is missing"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: all non-home destinations missing", int(strict_destination[f"{prefix}_ALL_MISSING"].sum()), matched_den, "strict matched rows"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: complete destination coverage", int(strict_destination[f"{prefix}_ALL_VALID"].sum()), matched_den, "strict matched rows"),
+                qa_row("DESTINATION SPATIAL QA", f"{source}: partial destination coverage", int(strict_destination[f"{prefix}_PARTIAL"].sum()), matched_den, "strict matched rows"),
+            ]
+        )
+
     for metric, column in [
         ("mean observed tour distance km", "TOUR_DISTANCE_KM"),
         ("median observed tour distance km", "TOUR_DISTANCE_KM"),
@@ -780,6 +914,7 @@ def build_qa_summary(
     ]:
         value = float(tours[column].mean()) if metric.startswith("mean") else float(tours[column].median())
         rows.append(qa_row("DESCRIPTIVE TOUR ATTRIBUTES", metric, value, None, "tours with a valid observed value"))
+    rows.extend(destination_rows)
     # Object dtype keeps true counts as integers while allowing descriptive
     # means/medians to share the requested compact `count` field.
     return pd.DataFrame(rows, dtype=object)
@@ -840,6 +975,7 @@ def print_final_summary(
     tours: pd.DataFrame,
     wide_input: pd.DataFrame,
     wide_output: pd.DataFrame,
+    qa: pd.DataFrame,
 ) -> None:
     eligible = prepared.loc[prepared["_CHAIN_ELIGIBLE"].eq(1)]
     matched = wide_output["TOUR_MATCH_FOUND"].eq(1)
@@ -863,6 +999,18 @@ def print_final_summary(
     print(f"output wide rows: {len(wide_output):,}")
     print(f"unique input CHOICE_ID: {wide_input['CHOICE_ID'].nunique():,}")
     print(f"unique output CHOICE_ID: {wide_output['CHOICE_ID'].nunique():,}")
+    print("\nDESTINATION SPATIAL QA")
+    spatial_qa = qa.loc[qa["section"].eq("DESTINATION SPATIAL QA")].set_index("metric")
+    for source, spec in DESTINATION_SPATIAL_SPECS.items():
+        first_missing = spatial_qa.loc[f"{source}: first non-home destination missing"]
+        worst_missing = spatial_qa.loc[f"{source}: {spec['feature']} missing"]
+        rescued = spatial_qa.loc[f"{source}: rescued by tour aggregation"]
+        rescued_among_missing = spatial_qa.loc[f"{source}: rescued among first-destination-missing"]
+        print(f"{source}:")
+        print(f"  first-destination missing share: {float(first_missing['share']):.6%}")
+        print(f"  worst-observed missing share: {float(worst_missing['share']):.6%}")
+        print(f"  rescued using later observed tour destinations: {int(rescued['count']):,}")
+        print(f"  rescued among first-destination-missing: {float(rescued_among_missing['share']):.6%}")
     print("\nOUTPUTS:")
     for path in [MEMBERSHIP_PATH, TOUR_FEATURES_PATH, WIDE_FEATURES_PATH, QA_PATH]:
         print(path)
@@ -882,6 +1030,8 @@ def main() -> None:
     wide_input = read_csv_strings(WIDE_BASE_PATH)
     prepared, initial_diagnostics = canonicalize_trip_attributes(trips_raw)
     membership, tour_meta, diagnostics = reconstruct_home_based_tours(prepared, initial_diagnostics)
+    reconstructed_tour_ids = tour_meta["TOUR_ID"].copy()
+    reconstructed_membership_source_ids = membership["SOURCE_ROW_ID"].copy()
     tours = build_tour_features(membership, tour_meta)
 
     assert_tour_integrity(prepared, membership, tours)
@@ -896,6 +1046,14 @@ def main() -> None:
         raise AssertionError("Trip-to-tour membership output contains duplicate SOURCE_ROW_ID values.")
     if len(tours) != tours["TOUR_ID"].nunique():
         raise AssertionError("Tour feature output does not contain one row per TOUR_ID.")
+    if len(tours) != len(tour_meta) or set(tours["TOUR_ID"]) != set(reconstructed_tour_ids):
+        raise AssertionError("Destination-spatial feature construction changed the reconstructed tour universe.")
+    if not membership_output["SOURCE_ROW_ID"].equals(reconstructed_membership_source_ids.reset_index(drop=True)):
+        raise AssertionError("Destination-spatial feature construction changed the membership SOURCE_ROW_ID universe or order.")
+    if not wide_output[["CHOICE_ID", "SOURCE_ROW_ID"]].equals(wide_input[["CHOICE_ID", "SOURCE_ROW_ID"]]):
+        raise AssertionError("Destination-spatial feature construction changed strict SOURCE_ROW_ID matching or row order.")
+    if any(spec["clean"] in membership_output.columns for spec in DESTINATION_SPATIAL_SPECS.values()):
+        raise AssertionError("Internal destination-spatial working columns leaked into membership output.")
 
     single_trip = tours.loc[tours["TOUR_N_TRIPS"].eq(1)]
     single_closed = single_trip["TOUR_CLOSED"].eq(1)
@@ -918,7 +1076,7 @@ def main() -> None:
     qa.to_csv(QA_PATH, index=False)
 
     print_tour_examples(membership, tours, wide_output)
-    print_final_summary(prepared, tours, wide_input, wide_output)
+    print_final_summary(prepared, tours, wide_input, wide_output, qa)
 
 
 if __name__ == "__main__":

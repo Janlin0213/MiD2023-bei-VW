@@ -1019,6 +1019,174 @@ def plot_primary_figure(summary: pd.DataFrame) -> Path:
     return output_path
 
 
+def plot_weighted_ecdf(sample: pd.DataFrame) -> Path:
+    def weighted_quantile(values: pd.Series, weights: pd.Series, quantile: float) -> float:
+        order = np.argsort(values.to_numpy())
+        sorted_values = values.to_numpy()[order]
+        sorted_weights = weights.to_numpy()[order]
+        cumulative_weights = np.cumsum(sorted_weights)
+        threshold = quantile * cumulative_weights[-1]
+        return float(sorted_values[np.searchsorted(cumulative_weights, threshold, side="left")])
+
+    def weighted_mean(values: pd.Series, weights: pd.Series) -> float:
+        return float(np.average(values.to_numpy(), weights=weights.to_numpy()))
+
+    def within_range_share(values: pd.Series, weights: pd.Series, upper: float) -> float:
+        mask = values.to_numpy() <= upper
+        total_weight = weights.to_numpy().sum()
+        if total_weight <= 0:
+            return 0.0
+        return float(weights.to_numpy()[mask].sum() / total_weight * 100.0)
+
+    panel_specifications = [
+        ("total", "anzwege2", "A  Total mobility — Trips per person/day", "Trips per person/day", "trips"),
+        (
+            "total",
+            "perskm2",
+            "B  Total mobility — Distance per person/day (km)",
+            "Distance per person/day (km)",
+            "distance",
+        ),
+        (
+            "pkw_driver",
+            "pkw_driver_trips_day",
+            "C  Pkw-driver mobility — Trips per person/day",
+            "Trips per person/day",
+            "trips",
+        ),
+        (
+            "pkw_driver",
+            "pkw_driver_km_day",
+            "D  Pkw-driver mobility — Distance per person/day (km)",
+            "Distance per person/day (km)",
+            "distance",
+        ),
+    ]
+    distance_series = []
+    for car_group in CAR_ORDER:
+        for outcome in ["perskm2", "pkw_driver_km_day"]:
+            group = sample.loc[sample["car_ownership_group"].eq(car_group), [outcome, "P_GEW"]]
+            distance_series.append(
+                (
+                    group[outcome].astype(float),
+                    group["P_GEW"].astype(float),
+                )
+            )
+    distance_display_limit = max(
+        weighted_quantile(values, weights, 0.95) for values, weights in distance_series
+    )
+
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.4), sharey=True)
+    for ax, (mobility_scope, outcome, panel_title, x_label, dimension) in zip(
+        axes.flat, panel_specifications
+    ):
+        annotation_blocks = []
+        for car_group in CAR_ORDER:
+            group = sample.loc[sample["car_ownership_group"].eq(car_group), [outcome, "P_GEW"]]
+            values = group[outcome].astype(float)
+            weights = group["P_GEW"].astype(float)
+            order = np.argsort(values.to_numpy(), kind="stable")
+            sorted_values = values.to_numpy()[order]
+            sorted_weights = weights.to_numpy()[order]
+            ecdf = np.cumsum(sorted_weights) / sorted_weights.sum()
+            color = CAR_STYLES[car_group]["color"]
+            ax.step(
+                sorted_values,
+                ecdf,
+                where="post",
+                color=color,
+                linewidth=2.1,
+                zorder=2,
+            )
+
+            mean_value = weighted_mean(values, weights)
+            ax.axvline(
+                mean_value,
+                color=color,
+                linewidth=1.0,
+                alpha=0.35,
+                zorder=1,
+            )
+
+            display_upper = 10.0 if dimension == "trips" else distance_display_limit
+            share_in_range = within_range_share(values, weights, display_upper)
+            max_value = float(values.max())
+            annotation_blocks.append(
+                (
+                    CAR_LABELS[car_group],
+                    f"mean = {mean_value:.2f}",
+                    f"{share_in_range:.1f}% within displayed range; max = {max_value:.1f}",
+                )
+            )
+
+        ax.set_title(panel_title, loc="left", fontsize=11.5, fontweight="bold")
+        ax.set_xlabel(x_label)
+        if dimension == "trips":
+            ax.set_xlim(0, 10)
+        else:
+            ax.set_xlim(0, distance_display_limit * 1.05)
+
+        annotation_y_positions = [0.90, 0.56]
+        for (label, mean_text, share_text), y_position in zip(annotation_blocks, annotation_y_positions):
+            ax.text(
+                0.98,
+                y_position,
+                f"{label}\n{mean_text}\n{share_text}",
+                transform=ax.transAxes,
+                fontsize=8.0,
+                color="#404040",
+                ha="right",
+                va="top",
+                linespacing=1.35,
+            )
+
+        ax.set_ylim(0, 1.02)
+        ax.set_yticks(np.linspace(0, 1, 6))
+        ax.grid(axis="y", color="#D9D9D9", linewidth=0.6, alpha=0.8)
+        ax.xaxis.grid(False)
+        ax.set_axisbelow(True)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.spines["left"].set_color("#B0B0B0")
+        ax.spines["bottom"].set_color("#808080")
+        ax.tick_params(length=0, colors="#404040")
+
+    axes[0, 0].set_ylabel("Cumulative share of persons")
+    axes[1, 0].set_ylabel("Cumulative share of persons")
+    fig.suptitle(
+        "Reference-day mobility intensity distributions by household car ownership",
+        x=0.08,
+        y=0.98,
+        ha="left",
+        fontsize=13.5,
+        fontweight="bold",
+    )
+    legend_handles = [
+        Line2D([0], [0], color=CAR_STYLES[car_group]["color"], linewidth=2.0, label=CAR_LABELS[car_group])
+        for car_group in CAR_ORDER
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.075),
+        ncol=2,
+        frameon=False,
+    )
+    fig.text(
+        0.08,
+        0.018,
+        "Survey-weighted ECDFs; the distance x-axis is truncated for visualization only at the maximum weighted P95 across all four distance series, while all observations are retained in the calculations.",
+        ha="left",
+        va="bottom",
+        fontsize=8.8,
+        color="#4A4A4A",
+    )
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.19, wspace=0.24, hspace=0.34)
+    output_path = OUTPUT_DIR / "reference_day_mobility_intensity_weighted_ecdf.png"
+    fig.savefig(output_path, dpi=300, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
 def load_accepted_total_output_baselines() -> dict[str, dict[str, Any]]:
     filenames = [
         "01_reference_day_mobility_summary.csv",
@@ -1166,6 +1334,7 @@ def main() -> None:
     write_csv(trip_qa, "04_pkw_driver_mobility_QA.csv")
     write_metadata(sample, results, special_counts)
     plot_primary_figure(summary)
+    plot_weighted_ecdf(sample)
     print_console_summary(
         persons, sample, summary, contrasts, special_counts, trip_metrics
     )
