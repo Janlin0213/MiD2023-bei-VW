@@ -1,4 +1,4 @@
-"""Compatibility entry point for accepted home-based-tour feature construction."""
+"""Stage entry point for accepted MNL model-input construction."""
 
 from pathlib import Path
 import sys
@@ -10,8 +10,7 @@ if __package__ in {None, ""}:
             sys.path.insert(0, str(candidate))
             break
 
-from src.thesis_pipeline.model_input.tour_features import *  # noqa: E402,F403
-from src.thesis_pipeline.model_input.tour_features import main  # noqa: E402,F401
+from src.thesis_pipeline.model_input.vehicle_choice import main  # noqa: E402
 
 
 if __name__ == "__main__":
