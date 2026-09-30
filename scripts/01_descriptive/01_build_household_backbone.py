@@ -70,7 +70,8 @@ def require_columns(columns: list[str], required: list[str], source: str) -> Non
     if source == "household" and "household_type" in missing:
         raise RuntimeError(
             "hh_selected_raw.csv is missing 'household_type'. Run the upstream "
-            "household-type construction step (src/build_household_type.py) first."
+            "household-type construction step "
+            "(uv run python -m src.thesis_pipeline.features.household_type) first."
         )
     raise KeyError(f"{source} input is missing required column(s): {missing}")
 

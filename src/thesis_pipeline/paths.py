@@ -87,20 +87,48 @@ PHASE1_DIR = RECONSTRUCTION_DIR / "phase1"
 PHASE2_DIR = RECONSTRUCTION_DIR / "phase2"
 PHASE3_DIR = RECONSTRUCTION_DIR / "phase3"
 PHASE3_SENSITIVITY_DIR = RECONSTRUCTION_DIR / "phase3_sensitivity"
+ALLOCATION_CANDIDATE_DIR = RECONSTRUCTION_DIR / "allocation_candidate"
 PHASE4_DIR = RECONSTRUCTION_DIR / "phase4"
 PHASE4_SENSITIVITY_DIR = RECONSTRUCTION_DIR / "phase4_sensitivity"
 
+ALLOCATION_CANDIDATE_OCCASIONS_PATH = (
+    ALLOCATION_CANDIDATE_DIR / "allocation_analysis_candidate_occasions.csv"
+)
+ALLOCATION_CANDIDATE_HOUSEHOLDS_PATH = (
+    ALLOCATION_CANDIDATE_DIR / "allocation_analysis_candidate_households.csv"
+)
+ALLOCATION_CANDIDATE_QA_PATH = (
+    ALLOCATION_CANDIDATE_DIR / "allocation_analysis_candidate_QA.csv"
+)
+
 MODEL_INPUT_DIR = DATA_PROCESSED_DIR / "model_input"
 MODEL_INPUT_SENSITIVITY_DIR = MODEL_INPUT_DIR / "sensitivity"
+ALLOCATION_CANDIDATE_MODEL_INPUT_PATH = (
+    MODEL_INPUT_DIR / "allocation_candidate_model_input.csv"
+)
+ALLOCATION_CANDIDATE_MODEL_INPUT_QA_PATH = (
+    MODEL_INPUT_DIR / "allocation_candidate_model_input_QA.csv"
+)
+SINGLE_DRIVER_MNL_DESIGN_MATRIX_PATH = (
+    MODEL_INPUT_DIR / "single_driver_mnl_design_matrix.csv"
+)
+SINGLE_DRIVER_MNL_DESIGN_MATRIX_QA_PATH = (
+    MODEL_INPUT_DIR / "single_driver_mnl_design_matrix_QA.csv"
+)
+SINGLE_DRIVER_MNL_ENCODING_SPEC_PATH = (
+    MODEL_INPUT_DIR / "single_driver_mnl_encoding_spec.md"
+)
 SCREENING_DIR = MODEL_INPUT_DIR
 
 EDA_PROCESSED_DIR = DATA_PROCESSED_DIR / "eda"
 THEME1_BACKBONE_DIR = EDA_PROCESSED_DIR / "statistical_test"
 BIPARTITE_DATA_DIR = EDA_PROCESSED_DIR / "bipartite"
+ALLOCATION_SAMPLE_SUPPORT_DATA_DIR = EDA_PROCESSED_DIR / "allocation_sample_support"
 
 DESCRIPTIVE_OUTPUT_DIR = OUTPUTS_DIR / "descriptive"
 EDA_OUTPUT_DIR = OUTPUTS_DIR / "eda"
 BIPARTITE_OUTPUT_DIR = EDA_OUTPUT_DIR / "bipartite"
+ALLOCATION_SAMPLE_SUPPORT_OUTPUT_DIR = EDA_OUTPUT_DIR / "allocation_sample_support"
 THEME1_OUTPUT_DIR = (
     EDA_OUTPUT_DIR / "statistical_tests" / "theme1_single_vs_multicar"
 )

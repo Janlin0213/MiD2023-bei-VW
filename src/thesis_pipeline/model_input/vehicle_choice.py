@@ -903,7 +903,7 @@ def _manifest_catalog() -> dict[str, dict[str, str]]:
         "quali_opnv_zo",
     )
 
-    add("household_type", "household", f"{households}; {persons}", "household_type or accepted aggregation of alter_gr5", "reuse src/build_household_type.py in memory when selected household file lacks the stored field", "household life stage", "family_household; young_household; adult_household; senior_household", "unknown becomes blank; rows retained", "validated thesis construct", "H_GR; HP_ALTER_1--6")
+    add("household_type", "household", f"{households}; {persons}", "household_type or accepted aggregation of alter_gr5", "reuse src.thesis_pipeline.features.household_type.build_household_type in memory when selected household file lacks the stored field", "household life stage", "family_household; young_household; adult_household; senior_household", "unknown becomes blank; rows retained", "validated thesis construct", "H_GR; HP_ALTER_1--6")
     add("hhgr_gr", "household", households, "hhgr_gr", "documented codes retained", "household size", "1,2,3,4,5 persons or more", "other codes become blank", "distinct size construct from household_type", "H_GR")
     add("H_MIETE", "household", households, "H_MIETE", "documented codes retained", "housing tenure", "1 rent; 2 ownership; 3 other", "9 and 309 become blank", "interpretable housing context")
     add("oek_status", "household", households, "oek_status", "documented codes retained", "economic status", "1 very low through 5 very high", "undocumented codes become blank", "official analytical socioeconomic measure", "hheink_gr2; aq_eink_gr")
