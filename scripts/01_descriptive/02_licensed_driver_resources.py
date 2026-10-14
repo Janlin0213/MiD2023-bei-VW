@@ -51,20 +51,20 @@ CAR_TERM = "C(car_ownership_group)[T.multi_car]"
 Z_95 = float(norm.ppf(0.975))
 
 LICENSED_SCOPE = (
-    "Complete licence information; Single = one car; Multi = two or 3+ cars; "
+    "Complete person roster and licence information; Single = one car; Multi = two or 3+ cars; "
     "valid positive finite H_GEW. Household-weighted estimates with HC3 robust "
     "SEs; not fully survey-design-adjusted."
 )
 EXACT_SCOPE = (
     "Exact driver/car ratio: Single = exactly one car; Multi = exactly two cars; "
-    "3+ households excluded because the denominator is top-coded; complete licence "
+    "3+ households excluded because the denominator is top-coded; complete person roster and licence "
     "information and valid positive finite H_GEW. Household-weighted estimates with "
     "HC3 robust SEs; not fully survey-design-adjusted."
 )
 CAPPED_SCOPE = (
     "Capped3 upper-bound sensitivity including 3+ households: Single = one car; "
     "Multi = two or 3+ cars. For 3+ households, licensed drivers / 3 is an upper-bound "
-    "proxy, not the exact driver/car ratio. Complete licence information and valid "
+    "proxy, not the exact driver/car ratio. Complete person roster and licence information and valid "
     "positive finite H_GEW. Household-weighted estimates with HC3 robust SEs; not "
     "fully survey-design-adjusted."
 )
@@ -113,6 +113,8 @@ def read_backbone() -> pd.DataFrame:
         "household_type",
         "n_licensed_drivers",
         "license_information_complete_flag",
+        "license_roster_complete_flag",
+        "H_GR",
         "driver_car_ratio_exact",
         "driver_car_ratio_capped3_upper_bound",
         "driver_car_ratio_exact_flag",
@@ -128,6 +130,8 @@ def read_backbone() -> pd.DataFrame:
         "RegioStaR4",
         "n_licensed_drivers",
         "license_information_complete_flag",
+        "license_roster_complete_flag",
+        "H_GR",
         "driver_car_ratio_exact",
         "driver_car_ratio_capped3_upper_bound",
         "driver_car_ratio_exact_flag",
@@ -139,7 +143,7 @@ def read_backbone() -> pd.DataFrame:
 def analysis_sample(frame: pd.DataFrame, outcome: str, *, exact: bool = False) -> pd.DataFrame:
     mask = (
         frame["car_ownership_group"].isin(CAR_ORDER)
-        & frame["license_information_complete_flag"].eq(1)
+        & frame["license_roster_complete_flag"].eq(1)
         & valid_weight_mask(frame["H_GEW"])
         & numeric(frame[outcome]).notna()
         & np.isfinite(numeric(frame[outcome]))
@@ -640,6 +644,7 @@ def plot_weighted_means(
 def build_sample_qa(frame: pd.DataFrame, samples: dict[str, pd.DataFrame]) -> pd.DataFrame:
     eligible = frame["car_ownership_group"].isin(CAR_ORDER) & valid_weight_mask(frame["H_GEW"])
     incomplete = eligible & ~frame["license_information_complete_flag"].eq(1)
+    strict_incomplete = eligible & ~frame["license_roster_complete_flag"].eq(1)
     eligible_weight_sum = float(frame.loc[eligible, "H_GEW"].sum())
     multi = eligible & frame["car_ownership_group"].eq("multi_car")
     three_plus = multi & frame["H_ANZAUTO"].eq(3)
@@ -649,6 +654,12 @@ def build_sample_qa(frame: pd.DataFrame, samples: dict[str, pd.DataFrame]) -> pd
             "count": int(incomplete.sum()),
             "share": float(frame.loc[incomplete, "H_GEW"].sum() / eligible_weight_sum),
             "notes": "H_GEW-weighted share among Single/Multi households with valid H_GEW; includes absent person roster.",
+        },
+        {
+            "metric": "Single/Multi households excluded due to incomplete roster or licence information",
+            "count": int(strict_incomplete.sum()),
+            "share": float(frame.loc[strict_incomplete, "H_GEW"].sum() / eligible_weight_sum),
+            "notes": "H_GEW-weighted share among Single/Multi households with valid H_GEW; H_GR=6 means 6+.",
         },
         {
             "metric": "unweighted share of 3+ among multi-car households",
@@ -672,6 +683,46 @@ def build_sample_qa(frame: pd.DataFrame, samples: dict[str, pd.DataFrame]) -> pd
                 "notes": "Share is an H_GEW-weighted coverage measure relative to valid-weight Single/Multi households.",
             }
         )
+    return pd.DataFrame(rows)
+
+
+def build_two_car_selection_qa(frame: pd.DataFrame) -> pd.DataFrame:
+    """Describe selection into the strict exact-two-car complete-case sample."""
+    eligible = frame.loc[frame["H_ANZAUTO"].eq(2) & valid_weight_mask(frame["H_GEW"])].copy()
+    strict = eligible["license_roster_complete_flag"].eq(1)
+    total_weight = float(eligible["H_GEW"].sum())
+    strict_weight = float(eligible.loc[strict, "H_GEW"].sum())
+
+    def row(section: str, category: Any, group: pd.DataFrame) -> dict[str, Any]:
+        old_group = group.loc[group["license_information_complete_flag"].eq(1)]
+        strict_group = group.loc[group["license_roster_complete_flag"].eq(1)]
+        group_weight = float(group["H_GEW"].sum())
+
+        def ratio(subset: pd.DataFrame) -> float:
+            weight = float(subset["H_GEW"].sum())
+            return float(np.average(subset["driver_car_ratio_exact"], weights=subset["H_GEW"])) if weight else np.nan
+
+        return {
+            "section": section,
+            "category": category,
+            "total_eligible_households": len(group),
+            "old_licence_complete_households": len(old_group),
+            "strict_complete_households": len(strict_group),
+            "unweighted_strict_retention": len(strict_group) / len(group) if len(group) else np.nan,
+            "weighted_strict_retention": float(strict_group["H_GEW"].sum()) / group_weight if group_weight else np.nan,
+            "full_sample_weighted_composition_share": group_weight / total_weight if section == "household_type" else np.nan,
+            "strict_sample_weighted_composition_share": float(strict_group["H_GEW"].sum()) / strict_weight if section == "household_type" else np.nan,
+            "composition_difference_pp": 100 * (float(strict_group["H_GEW"].sum()) / strict_weight - group_weight / total_weight) if section == "household_type" else np.nan,
+            "old_licence_complete_weighted_ratio": ratio(old_group) if section in {"overall", "household_type"} else np.nan,
+            "strict_complete_weighted_ratio": ratio(strict_group) if section in {"overall", "household_type"} else np.nan,
+            "notes": "Old and strict ratios use different household populations; differences are not causal corrections." if section in {"overall", "household_type"} else "H_GR=6 means six or more members.",
+        }
+
+    rows = [row("overall", "all_exact_two_car", eligible)]
+    for category, group in eligible.groupby("household_type", dropna=False):
+        rows.append(row("household_type", category, group))
+    for category, group in eligible.groupby("H_GR", dropna=False):
+        rows.append(row("H_GR", category, group))
     return pd.DataFrame(rows)
 
 
@@ -759,6 +810,7 @@ def main() -> None:
     }
     sample_qa = build_sample_qa(backbone, samples)
     write_csv(sample_qa, "analysis_sample_QA.csv")
+    write_csv(build_two_car_selection_qa(backbone), "two_car_selection_QA.csv")
 
     # This active producer owns the household-type summary consumed by both
     # licensed-driver plotting scripts. It uses the existing generic sample and

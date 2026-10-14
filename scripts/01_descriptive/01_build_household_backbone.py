@@ -32,6 +32,7 @@ QA_PATH = BACKBONE_DIR / "theme1_household_backbone_QA.csv"
 HOUSEHOLD_COLUMNS = [
     "H_ID",
     "H_GEW",
+    "H_GR",
     "H_ANZAUTO",
     "RegioStaR4",
     "household_type",
@@ -272,6 +273,16 @@ def construct_backbone(
         & backbone["n_license_unresolved"].eq(0)
     ).astype("int8")
 
+    household_size = numeric(backbone["H_GR"])
+    backbone["person_roster_complete_flag"] = (
+        (household_size.isin([1, 2, 3, 4, 5]) & backbone["n_person_records"].eq(household_size))
+        | (household_size.eq(6) & backbone["n_person_records"].ge(6))
+    ).fillna(False).astype("int8")
+    backbone["license_roster_complete_flag"] = (
+        backbone["person_roster_complete_flag"].eq(1)
+        & backbone["license_information_complete_flag"].eq(1)
+    ).astype("int8")
+
     backbone["H_GEW"] = numeric(backbone["H_GEW"])
     backbone["H_ANZAUTO"] = numeric(backbone["H_ANZAUTO"]).astype("Int64")
     backbone["RegioStaR4"] = numeric(backbone["RegioStaR4"]).astype("Int64")
@@ -309,6 +320,9 @@ def construct_backbone(
         "driver_car_ratio_exact",
         "driver_car_ratio_capped3_upper_bound",
         "driver_car_ratio_exact_flag",
+        "H_GR",
+        "person_roster_complete_flag",
+        "license_roster_complete_flag",
     ]
     backbone = backbone[ordered_columns]
 
