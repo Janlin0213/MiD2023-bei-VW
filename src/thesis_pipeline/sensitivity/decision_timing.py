@@ -58,7 +58,7 @@ def ids(frame):
         )
 
 
-def overlap_equal(baseline, sensitivity, diagnostic_path=None):
+def overlap_equal(baseline, sensitivity, diagnostic_path=None, allowed_changed_columns=frozenset()):
     ids(baseline)
     ids(sensitivity)
     if list(baseline.columns) != list(sensitivity.columns):
@@ -105,9 +105,10 @@ def overlap_equal(baseline, sensitivity, diagnostic_path=None):
         print(f"Weight tolerance failures: {int(weight_bad.sum())}; diagnostic: {path}")
     else:
         print("W_GEW baseline-overlap numerical equality: PASS\ntolerance failures: 0")
-    if differences.any().any():
+    unexpected = [column for column in old.columns if differences[column].any() and column not in allowed_changed_columns]
+    if unexpected:
         samples = []
-        for column in old.columns:
+        for column in unexpected:
             for key in old.index[differences[column]][:10]:
                 samples.append(
                     {
@@ -121,7 +122,7 @@ def overlap_equal(baseline, sensitivity, diagnostic_path=None):
                 break
         print(pd.DataFrame(samples[:10]).to_string(index=False))
         raise AssertionError(
-            "Baseline overlap differs: exact discrete comparison; continuous "
+            f"Baseline overlap differs in {unexpected}: exact discrete comparison; continuous "
             "rtol=1e-12, atol=1e-15."
         )
     return sensitivity.loc[

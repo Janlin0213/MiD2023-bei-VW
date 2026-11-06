@@ -53,9 +53,22 @@ def main():
     if missing:
         raise AssertionError(f"Baseline-retained columns cannot be constructed: {sorted(missing)}")
     final = merged[list(baseline.columns)].copy()
+    # Preserve the accepted sensitivity definition: household accompaniment at
+    # the focal departure. Strict/candidate inputs use verified tour driving.
+    departure = pd.read_csv(paths.trips, usecols=["SOURCE_ROW_ID", "W_BEGL_HH"],
+                            dtype=str, keep_default_na=False)
+    if departure.SOURCE_ROW_ID.duplicated().any():
+        raise AssertionError("Sensitivity departure SOURCE_ROW_ID is not unique.")
+    focal = final.SOURCE_ROW_ID.map(departure.set_index("SOURCE_ROW_ID").W_BEGL_HH)
+    if focal.isna().any():
+        raise AssertionError("Sensitivity departure accompaniment source is missing.")
+    final["HOUSEHOLD_ACCOMPANIED"] = pd.to_numeric(focal, errors="coerce").map(
+        {1: 1, 2: 0, 716: 0}
+    ).astype("Int64")
     accepted.run_final_assertions(invariants,backbone,merged,final,vehicle)
     final_csv = serialized(final)
-    added = overlap_equal(baseline,final_csv)
+    added = overlap_equal(baseline,final_csv,
+                          allowed_changed_columns=frozenset({"HOUSEHOLD_ACCOMPANIED"}))
     ids(final_csv)
     if len(final) != len(backbone):
         raise AssertionError("Sensitivity row count changed.")
@@ -103,7 +116,8 @@ def main():
     # Byte-for-byte reproduction preserves all accepted substantive definitions.
     MANIFEST.write_bytes(paths.manifest.read_bytes())
     pd.DataFrame(rows).to_csv(QA,index=False)
-    overlap_equal(baseline,read(MODEL))
+    overlap_equal(baseline,read(MODEL),
+                  allowed_changed_columns=frozenset({"HOUSEHOLD_ACCOMPANIED"}))
     check_fingerprints(before)
     print("\nDECISION-TIMING SENSITIVITY DOWNSTREAM PIPELINE")
     for k,v in summary.items(): print(f"{k}: {v}")

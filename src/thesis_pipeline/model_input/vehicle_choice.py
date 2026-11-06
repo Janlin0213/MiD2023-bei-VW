@@ -10,6 +10,7 @@ CSVs without changing or re-filtering the strict choice universe.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import argparse
 import importlib.util
 from pathlib import Path
 import sys
@@ -76,6 +77,8 @@ TOUR_CONTEXT_COLUMNS = [
     "TOUR_N_NONHOME_STOPS",
     "TOUR_N_DISTINCT_PURPOSES",
     "TOUR_FIRST_PURPOSE",
+    "TOUR_MAIN_PURPOSE",
+    "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2",
     "TOUR_HAS_WORK",
     "TOUR_HAS_BUSINESS",
     "TOUR_HAS_EDUCATION",
@@ -147,9 +150,12 @@ BACKBONE_TOUR_SOURCE_COLUMNS = [
     "START_MIN",
     "TOUR_DISTANCE_KM",
     "TOUR_TRAVEL_TIME_MIN",
+    "HOUSEHOLD_ACCOMPANIED",
     "TOUR_N_NONHOME_STOPS",
     "TOUR_N_DISTINCT_PURPOSES",
     "TOUR_FIRST_PURPOSE",
+    "TOUR_MAIN_PURPOSE",
+    "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2",
     "TOUR_HAS_WORK",
     "TOUR_HAS_BUSINESS",
     "TOUR_HAS_EDUCATION",
@@ -168,7 +174,6 @@ TRIP_SOURCE_COLUMNS = [
     "saison",
     "ST_JAHR",
     "W_ANZBEGL",
-    "W_BEGL_HH",
     "P_STWETTER",
 ]
 
@@ -222,7 +227,6 @@ FORBIDDEN_EXPLICIT = {
     "TOUR_OPEN_END_FLAG",
     "TOUR_CLOSED",
     "TOUR_ELAPSED_TIME_MIN",
-    "TOUR_MAIN_PURPOSE",
     "W_ZWECK",
     "zweck",
     "hwzweck1",
@@ -300,11 +304,6 @@ def read_csv_strings(path: Path, usecols: list[str] | None = None) -> pd.DataFra
 
 
 def load_inputs(paths: Paths) -> dict[str, pd.DataFrame]:
-    if not paths.model_input.exists():
-        raise FileNotFoundError(
-            "Controlled destination-context replacement requires the accepted existing model input: "
-            f"{paths.model_input}"
-        )
     backbone_columns = list(dict.fromkeys([*ESTIMATION_COLUMNS, *BACKBONE_TOUR_SOURCE_COLUMNS]))
     household_header = pd.read_csv(paths.households, nrows=0).columns.tolist()
     household_columns = [*HOUSEHOLD_SOURCE_COLUMNS]
@@ -316,7 +315,6 @@ def load_inputs(paths: Paths) -> dict[str, pd.DataFrame]:
         "households": read_csv_strings(paths.households, household_columns),
         "persons": read_csv_strings(paths.persons, PERSON_SOURCE_COLUMNS),
         "vehicles": read_csv_strings(paths.vehicles, VEHICLE_SOURCE_COLUMNS),
-        "previous_model": read_csv_strings(paths.model_input),
     }
 
 
@@ -437,7 +435,7 @@ def canonicalize_candidate_registry(path: Path) -> list[dict[str, str]]:
         {"final": "TOUR_TRAVEL_TIME_MIN", "selected": "TOUR_TRAVEL_TIME_MIN", "dropped": "wegmin_imp2, wegmin_imp2_gr, LEG_TRAVEL_TIME_MIN", "reason": "accepted tour demand replaces immediate-trip duration"},
         {"final": "TOUR_N_NONHOME_STOPS", "selected": "TOUR_N_NONHOME_STOPS", "dropped": "TOUR_N_TRIPS, TOUR_MULTI_STOP_FLAG", "reason": "direct compact tour-complexity count"},
         {"final": "TOUR_N_DISTINCT_PURPOSES", "selected": "TOUR_N_DISTINCT_PURPOSES", "dropped": "TOUR_MULTI_PURPOSE_FLAG", "reason": "purpose-complexity count contains the binary transformation"},
-        {"final": "TOUR_FIRST_PURPOSE", "selected": "TOUR_FIRST_PURPOSE", "dropped": "W_ZWECK, zweck, hwzweck1, hwzweck2, LEG_PURPOSE, TOUR_MAIN_PURPOSE", "reason": "home-origin tour-start purpose is complete for the strict baseline"},
+        {"final": "TOUR_FIRST_PURPOSE", "selected": "TOUR_FIRST_PURPOSE", "dropped": "W_ZWECK, zweck, LEG_PURPOSE", "reason": "raw tour-start purpose retained alongside official main and observed longest-driver purposes"},
         {"final": "START_MIN", "selected": "START_MIN", "dropped": "W_SZ, sz_gr1, sz_gr2", "reason": "accepted continuous departure time"},
         {"final": "DAY_TYPE", "selected": "ST_WOTAG + feiertag", "dropped": "ST_WOTAG, feiertag", "reason": "single documented day context with holiday precedence"},
         {"final": "saison", "selected": "saison", "dropped": "ST_MONAT, ST_JAHR", "reason": "single documented seasonality construct"},
@@ -473,9 +471,12 @@ def select_tour_features(backbone: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Accepted TOUR_TRAVEL_TIME_MIN contains missing or negative values.")
     out["TOUR_DISTANCE_KM"] = distance
     out["TOUR_TRAVEL_TIME_MIN"] = duration
+    out["HOUSEHOLD_ACCOMPANIED"] = valid_integer(backbone["HOUSEHOLD_ACCOMPANIED"], [0, 1])
     out["TOUR_N_NONHOME_STOPS"] = valid_range_integer(backbone["TOUR_N_NONHOME_STOPS"], 0, 100)
     out["TOUR_N_DISTINCT_PURPOSES"] = valid_range_integer(backbone["TOUR_N_DISTINCT_PURPOSES"], 0, 7)
     out["TOUR_FIRST_PURPOSE"] = valid_range_integer(backbone["TOUR_FIRST_PURPOSE"], 1, 16)
+    out["TOUR_MAIN_PURPOSE"] = valid_integer(backbone["TOUR_MAIN_PURPOSE"], range(1, 8))
+    out["TOUR_LONGEST_DRIVER_TRIP_HWZWECK2"] = valid_integer(backbone["TOUR_LONGEST_DRIVER_TRIP_HWZWECK2"], range(1, 8))
     for column in [
         "TOUR_HAS_WORK",
         "TOUR_HAS_BUSINESS",
@@ -510,7 +511,6 @@ def select_trip_context_features(trips: pd.DataFrame) -> pd.DataFrame:
     out["DAY_TYPE"] = day_type
     out["saison"] = valid_integer(trips["saison"], [1, 2, 3, 4])
     out["W_ANZBEGL"] = valid_range_integer(trips["W_ANZBEGL"], 0, 25)
-    out["HOUSEHOLD_ACCOMPANIED"] = numeric(trips["W_BEGL_HH"]).map({1: 1, 2: 0, 716: 0}).astype("Int64")
     out["P_STWETTER"] = valid_integer(trips["P_STWETTER"], [1, 2, 3, 4, 5, 6])
     out["_REPORT_YEAR"] = valid_integer(trips["ST_JAHR"], [2023, 2024])
     out["_TRIP_KEY_MATCH"] = 1
@@ -639,7 +639,7 @@ def merge_features(
         if column != "START_MIN":
             values = (
                 tour[column].array
-                if column in TOUR_DESTINATION_CONTEXT_COLUMNS
+                if column in [*TOUR_DESTINATION_CONTEXT_COLUMNS, "HOUSEHOLD_ACCOMPANIED"]
                 else tour[column].to_numpy()
             )
             merged[column] = values
@@ -691,6 +691,8 @@ def validate_missing_codes(frame: pd.DataFrame) -> None:
         "TOUR_HAS_ESCORT": {0, 1},
         "TOUR_HAS_OTHER_PURPOSE": {0, 1},
         "HOUSEHOLD_ACCOMPANIED": {0, 1},
+        "TOUR_MAIN_PURPOSE": set(range(1, 8)),
+        "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2": set(range(1, 8)),
         "P_STWETTER": {1, 2, 3, 4, 5, 6},
         "TOUR_WORST_XMSTADT_ZO": {1, 2, 3, 4, 5, 6},
         "TOUR_WORST_QUALI_OPNV_ZO": {1, 2, 3, 4},
@@ -729,7 +731,9 @@ def drop_constant_features(frame: pd.DataFrame) -> tuple[list[str], list[str]]:
     excluded: list[str] = []
     retained: list[str] = []
     for column in explanatory:
-        if frame[column].nunique(dropna=True) <= 1:
+        if frame[column].nunique(dropna=True) <= 1 and column not in {
+            "TOUR_FIRST_PURPOSE", "TOUR_MAIN_PURPOSE", "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2"
+        }:
             excluded.append(column)
         else:
             retained.append(column)
@@ -737,85 +741,43 @@ def drop_constant_features(frame: pd.DataFrame) -> tuple[list[str], list[str]]:
     return final_columns, excluded
 
 
-def validate_controlled_replacement(previous: pd.DataFrame, final: pd.DataFrame) -> dict[str, object]:
-    previous_columns = list(previous.columns)
-    final_columns = list(final.columns)
-    missing_old = [column for column in OLD_DESTINATION_CONTEXT_COLUMNS if column not in previous_columns]
-    if missing_old:
-        raise AssertionError(
-            "Accepted reference model input lacks destination-context column(s) required for replacement: "
-            f"{missing_old}."
-        )
-    retained_columns = [
-        column for column in previous_columns if column not in OLD_DESTINATION_CONTEXT_COLUMNS
-    ]
-    old_position = previous_columns.index(OLD_DESTINATION_CONTEXT_COLUMNS[0])
-    if previous_columns[old_position : old_position + 2] != OLD_DESTINATION_CONTEXT_COLUMNS:
-        raise AssertionError("Accepted first-destination columns are not adjacent in their canonical position.")
+def compare_against_previous(previous: pd.DataFrame, final: pd.DataFrame) -> dict[str, object]:
+    """Compare every old field by CHOICE_ID before writing; only two purpose fields may be new.
 
-    expected_columns = [
-        *previous_columns[:old_position],
-        *TOUR_DESTINATION_CONTEXT_COLUMNS,
-        *previous_columns[old_position + len(OLD_DESTINATION_CONTEXT_COLUMNS) :],
-    ]
-    removed_columns = [column for column in previous_columns if column not in final_columns]
-    added_columns = [column for column in final_columns if column not in previous_columns]
-    if removed_columns != OLD_DESTINATION_CONTEXT_COLUMNS:
-        raise AssertionError(
-            f"Controlled replacement removed unexpected columns: {removed_columns}."
-        )
-    if added_columns != TOUR_DESTINATION_CONTEXT_COLUMNS:
-        raise AssertionError(
-            f"Controlled replacement introduced unexpected columns: {added_columns}."
-        )
-    if any(column in final_columns for column in OLD_DESTINATION_CONTEXT_COLUMNS):
-        raise AssertionError("Final model input still contains the replaced first-destination variables.")
-    if any(column not in final_columns for column in TOUR_DESTINATION_CONTEXT_COLUMNS):
-        raise AssertionError("Final model input lacks a required tour-level destination-context variable.")
-    if final_columns != expected_columns:
-        raise AssertionError(
-            "Controlled replacement must preserve column order and substitute only the destination-context pair."
-        )
-    if [column for column in final_columns if column not in TOUR_DESTINATION_CONTEXT_COLUMNS] != retained_columns:
-        raise AssertionError("Pre-existing retained columns changed order during controlled replacement.")
-    if len(final) != len(previous):
-        raise AssertionError("Controlled replacement changed the accepted row count.")
-
-    for column in retained_columns:
+    Continuous CSV round trips use rtol=1e-12, atol=1e-15. IDs, categorical
+    codes, weights, and all other explanatory attributes compare exactly.
+    """
+    old_columns = list(previous.columns)
+    new_columns = list(final.columns)
+    allowed_added = {"TOUR_MAIN_PURPOSE", "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2"}
+    removed = [c for c in old_columns if c not in new_columns]
+    added = [c for c in new_columns if c not in old_columns]
+    if removed or set(added) - allowed_added:
+        raise AssertionError(f"Regression schema changed: removed={removed}, unexpected added={set(added)-allowed_added}")
+    if [c for c in new_columns if c in old_columns] != old_columns:
+        raise AssertionError("Old column order changed.")
+    if len(previous) != len(final):
+        raise AssertionError("Regression comparison changed row count.")
+    old_ids = previous["CHOICE_ID"].astype("string").reset_index(drop=True)
+    new_ids = final["CHOICE_ID"].astype("string").reset_index(drop=True)
+    if old_ids.isna().any() or not old_ids.is_unique or not old_ids.equals(new_ids):
+        raise AssertionError("CHOICE_ID universe or order changed.")
+    continuous = {"TOUR_DISTANCE_KM", "TOUR_TRAVEL_TIME_MIN"}
+    for column in old_columns:
         before = previous[column].astype("string").fillna("").reset_index(drop=True)
         after = final[column].astype("string").fillna("").reset_index(drop=True)
-        if not after.equals(before):
-            mismatch = after.ne(before)
-            first_position = int(mismatch[mismatch].index[0])
-            raise AssertionError(
-                f"Controlled replacement changed accepted column {column} at row position {first_position}."
-            )
-    if previous["CHOICE_ID"].nunique() != final["CHOICE_ID"].nunique():
-        raise AssertionError("Controlled replacement changed the unique CHOICE_ID count.")
-    if previous["H_ID"].nunique() != final["H_ID"].nunique():
-        raise AssertionError("Controlled replacement changed the household count.")
-    if previous["HP_ID"].nunique() != final["HP_ID"].nunique():
-        raise AssertionError("Controlled replacement changed the person count.")
-    before_choice_distribution = previous["CHOICE"].value_counts(dropna=False).sort_index()
-    after_choice_distribution = final["CHOICE"].astype("string").value_counts(dropna=False).sort_index()
-    if not before_choice_distribution.equals(after_choice_distribution):
-        raise AssertionError("Controlled replacement changed the CHOICE distribution.")
-    return {
-        "rows_before": len(previous),
-        "rows_after": len(final),
-        "columns_before": len(previous_columns),
-        "columns_after": len(final_columns),
-        "unique_choice_id_before": previous["CHOICE_ID"].nunique(),
-        "unique_choice_id_after": final["CHOICE_ID"].nunique(),
-        "households_before": previous["H_ID"].nunique(),
-        "households_after": final["H_ID"].nunique(),
-        "persons_before": previous["HP_ID"].nunique(),
-        "persons_after": final["HP_ID"].nunique(),
-        "existing_column_count": len(retained_columns),
-        "existing_column_equality": "PASS",
-        "removed_columns": ", ".join(removed_columns),
-        "added_columns": ", ".join(added_columns),
-    }
+        if column in continuous:
+            a = pd.to_numeric(before.replace("", pd.NA), errors="coerce").to_numpy(dtype=float)
+            b = pd.to_numeric(after.replace("", pd.NA), errors="coerce").to_numpy(dtype=float)
+            same = np.isclose(a, b, rtol=1e-12, atol=1e-15, equal_nan=True)
+        else:
+            same = before.eq(after).to_numpy(dtype=bool)
+        if not same.all():
+            positions = np.flatnonzero(~same)[:5]
+            examples = [(str(new_ids.iloc[i]), str(before.iloc[i]), str(after.iloc[i])) for i in positions]
+            raise AssertionError(f"Regression changed existing column {column}; CHOICE_ID/old/new: {examples}")
+    return {"rows": len(final), "old_columns": len(old_columns), "added_columns": added,
+            "existing_column_equality": "PASS"}
 
 
 def _manifest_catalog() -> dict[str, dict[str, str]]:
@@ -872,11 +834,13 @@ def _manifest_catalog() -> dict[str, dict[str, str]]:
     add("TOUR_TRAVEL_TIME_MIN", "tour", backbone, "TOUR_TRAVEL_TIME_MIN", "numeric accepted tour total", "tour demand", "non-negative minutes", "none in accepted backbone", "canonical demand duration", "wegmin_imp2; wegmin_imp2_gr; LEG_TRAVEL_TIME_MIN")
     add("TOUR_N_NONHOME_STOPS", "tour", backbone, "TOUR_N_NONHOME_STOPS", "documented non-negative count", "tour complexity", "integer 0 or greater", "undocumented values become blank", "compact stop-complexity measure", "TOUR_N_TRIPS; TOUR_MULTI_STOP_FLAG")
     add("TOUR_N_DISTINCT_PURPOSES", "tour", backbone, "TOUR_N_DISTINCT_PURPOSES", "documented count of broad purpose indicators", "purpose complexity", "integer 0--7", "undocumented values become blank", "compact purpose-complexity measure", "TOUR_MULTI_PURPOSE_FLAG")
-    add("TOUR_FIRST_PURPOSE", "tour", backbone, "TOUR_FIRST_PURPOSE", "documented purpose codes retained", "tour-start purpose", "MiD purpose codes 1--16", "99/undocumented values become blank", "home-origin departure purpose is complete baseline concept", "W_ZWECK; zweck; hwzweck1; hwzweck2; LEG_PURPOSE; TOUR_MAIN_PURPOSE")
+    add("TOUR_FIRST_PURPOSE", "tour", backbone, "TOUR_FIRST_PURPOSE", "documented purpose codes retained", "tour-start purpose", "MiD purpose codes 1--16", "99/undocumented values become blank", "raw candidate context; unchanged from LEG_PURPOSE", "W_ZWECK; zweck; LEG_PURPOSE")
+    add("TOUR_MAIN_PURPOSE", "tour", backbone, "closing-trip hwzweck2", "retain valid 1--7 on closed tours", "official closed-tour main purpose", "hwzweck2 codes 1--7", "open tours and invalid codes remain blank", "candidate context, not automatically active regressor")
+    add("TOUR_LONGEST_DRIVER_TRIP_HWZWECK2", "tour", backbone, "longest eligible personal household-car driving trip hwzweck2", "select longest valid duration before inspecting purpose; unresolved maximum ties remain blank", "observed driver-trip purpose", "hwzweck2 codes 1--7", "no eligible trip, invalid duration or purpose, and unresolved ties remain blank", "alternative exploratory candidate context, not automatically active regressor")
     for name in ["TOUR_HAS_WORK", "TOUR_HAS_BUSINESS", "TOUR_HAS_EDUCATION", "TOUR_HAS_SHOPPING", "TOUR_HAS_ERRAND", "TOUR_HAS_LEISURE", "TOUR_HAS_ESCORT", "TOUR_HAS_OTHER_PURPOSE"]:
         add(name, "tour", backbone, name, "documented binary retained", "observed tour purpose composition", "0 no; 1 yes", "other codes become blank", "substantive behavioural composition feature")
     add("W_ANZBEGL", "departure", trips, "W_ANZBEGL", "retain documented direct count", "departure accompaniment", "integer 0--25 (25=25 or more)", "99 and 701 become blank", "direct count at vehicle-selection moment", "anzbegl; anzpers")
-    add("HOUSEHOLD_ACCOMPANIED", "departure", trips, "W_BEGL_HH", "1->1; 2 or documented no-accompaniment 716->0", "household accompaniment", "0 no household companion; 1 household companion", "9/202/701/717/995 become blank", "distinct from total accompaniment count")
+    add("HOUSEHOLD_ACCOMPANIED", "tour", backbone, "pkw_fmf + W_BEGL_HH via verified TOUR_ID/PERSON_KEY/SOURCE_ROW_ID membership", "1 if any confirmed household companion on focal person's verified driving trips; 0 only if every verified driving trip reports No and no unresolved driver status; otherwise missing", "observed tour-driving household accompaniment", "0 confirmed no; 1 confirmed yes", "ambiguous driver status or unknown driving-trip response remains missing unless another verified driving trip confirms yes", "distinct from focal departure and passenger accompaniment")
     add("P_STWETTER", "departure", trips, "P_STWETTER", "documented weather codes retained", "weather context", "1 sunny; 2 lightly cloudy; 3 changeable; 4 overcast; 5 rainy; 6 snow", "9 and proxy code 210 become blank", "single reporting-day weather representation")
     add(
         "TOUR_WORST_XMSTADT_ZO",
@@ -1009,7 +973,7 @@ def build_QA_summary(
     merge_metrics: dict[str, int],
     canonicalization: list[dict[str, str]],
     constant_exclusions: list[str],
-    replacement_comparison: dict[str, object],
+    replacement_comparison: dict[str, object] | None,
 ) -> pd.DataFrame:
     backbone = inputs["backbone"]
     rows: list[dict[str, object]] = []
@@ -1060,41 +1024,15 @@ def build_QA_summary(
         for value, count in numeric(final[column]).value_counts().sort_index().items():
             rows.append(qa_row("STRUCTURAL_QA", f"{column} distribution", variable=str(int(value)), value=int(count), denominator=len(final), share=int(count) / len(final)))
 
-    rows.extend(
-        [
-            qa_row("CONTROLLED_REPLACEMENT", "rows before", value=replacement_comparison["rows_before"]),
-            qa_row("CONTROLLED_REPLACEMENT", "rows after", value=replacement_comparison["rows_after"]),
-            qa_row("CONTROLLED_REPLACEMENT", "columns before", value=replacement_comparison["columns_before"]),
-            qa_row("CONTROLLED_REPLACEMENT", "columns after", value=replacement_comparison["columns_after"]),
-            qa_row("CONTROLLED_REPLACEMENT", "unique CHOICE_ID before", value=replacement_comparison["unique_choice_id_before"]),
-            qa_row("CONTROLLED_REPLACEMENT", "unique CHOICE_ID after", value=replacement_comparison["unique_choice_id_after"]),
-            qa_row("CONTROLLED_REPLACEMENT", "households before", value=replacement_comparison["households_before"]),
-            qa_row("CONTROLLED_REPLACEMENT", "households after", value=replacement_comparison["households_after"]),
-            qa_row("CONTROLLED_REPLACEMENT", "persons before", value=replacement_comparison["persons_before"]),
-            qa_row("CONTROLLED_REPLACEMENT", "persons after", value=replacement_comparison["persons_after"]),
-            qa_row(
-                "CONTROLLED_REPLACEMENT",
-                "only removed columns",
-                variable=replacement_comparison["removed_columns"],
-                value="PASS",
-                details="Removed only the accepted first-destination representation.",
-            ),
-            qa_row(
-                "CONTROLLED_REPLACEMENT",
-                "only added columns",
-                variable=replacement_comparison["added_columns"],
-                value="PASS",
-                details="Replaced the old pair in place after P_STWETTER.",
-            ),
-            qa_row(
-                "CONTROLLED_REPLACEMENT",
-                "other existing-column equality check",
-                variable=str(replacement_comparison["existing_column_count"]),
-                value=replacement_comparison["existing_column_equality"],
-                details="Every pre-existing column compared row-for-row in its accepted order.",
-            ),
-        ]
-    )
+    rows.append(qa_row("REGRESSION_COMPARISON", "optional comparison",
+                       value="PASS" if replacement_comparison else "NOT_REQUESTED",
+                       details="All previous columns checked before output write" if replacement_comparison else "Normal build uses upstream sources only"))
+    if replacement_comparison:
+        rows.append(qa_row("REGRESSION_COMPARISON", "new purpose columns", variable=", ".join(replacement_comparison["added_columns"]), value=len(replacement_comparison["added_columns"])))
+    for purpose_column in ["TOUR_FIRST_PURPOSE", "TOUR_MAIN_PURPOSE", "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2"]:
+        rows.append(qa_row("PURPOSE", "observed categories", variable=purpose_column,
+                           value=final[purpose_column].nunique(dropna=True), denominator=len(final),
+                           details="Retained candidate even with limited variation"))
 
     for column in TOUR_DESTINATION_CONTEXT_COLUMNS:
         valid_count = int(final[column].notna().sum())
@@ -1306,42 +1244,20 @@ def print_vehicle_examples(final: pd.DataFrame) -> None:
     print(examples.to_string(index=False))
 
 
-def print_final_summary(
-    paths: Paths,
-    final: pd.DataFrame,
-    replacement_comparison: dict[str, object],
-) -> None:
-    print("\nCONTROLLED DESTINATION-CONTEXT REPLACEMENT")
-    print(f"\nrows before: {replacement_comparison['rows_before']:,}")
-    print(f"rows after: {replacement_comparison['rows_after']:,}")
-    print(f"unique choices before: {replacement_comparison['unique_choice_id_before']:,}")
-    print(f"unique choices after: {replacement_comparison['unique_choice_id_after']:,}")
-    print(f"households before: {replacement_comparison['households_before']:,}")
-    print(f"households after: {replacement_comparison['households_after']:,}")
-    print(f"persons before: {replacement_comparison['persons_before']:,}")
-    print(f"persons after: {replacement_comparison['persons_after']:,}")
-    print(f"\ncolumns before: {replacement_comparison['columns_before']:,}")
-    print(f"columns after: {replacement_comparison['columns_after']:,}")
-    print(f"removed columns: {replacement_comparison['removed_columns']}")
-    print(f"added columns: {replacement_comparison['added_columns']}")
-    for feature in TOUR_DESTINATION_CONTEXT_COLUMNS:
-        valid_count = int(final[feature].notna().sum())
-        print(f"\n{feature} valid: {valid_count:,}")
-        print(f"{feature} missing: {len(final) - valid_count:,}")
-        print(f"{feature} missing share: {(len(final) - valid_count) / len(final):.2%}")
-    print(f"\nOther existing-column equality check: {replacement_comparison['existing_column_equality']}")
-    print("\nOUTPUTS UPDATED:")
+def print_final_summary(paths: Paths, final: pd.DataFrame, comparison: dict[str, object] | None) -> None:
+    print(f"\nCANONICAL MODEL INPUT: {len(final):,} rows x {len(final.columns):,} columns")
+    print(f"Optional old-output comparison: {'PASS' if comparison else 'not requested'}")
+    print("OUTPUTS UPDATED:")
     print(paths.model_input.resolve())
     print(paths.manifest.resolve())
     print(paths.qa.resolve())
-    print(
-        "\nThe first-destination representation was replaced by the accepted Phase 4 "
-        "tour-level worst-observed representation. No reconstruction, sample-selection, "
-        "tour logic, or other model-input feature changed."
-    )
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Build canonical vehicle-choice model input")
+    parser.add_argument("--compare-against", type=Path, metavar="PATH",
+                        help="optional previous CSV to compare before overwriting outputs")
+    args = parser.parse_args()
     paths = resolve_paths()
     inputs = load_inputs(paths)
     backbone_invariants = validate_backbone(inputs["backbone"])
@@ -1360,7 +1276,7 @@ def main() -> None:
     validate_missing_codes(merged)
     final_columns, constant_exclusions = drop_constant_features(merged)
     final = merged[final_columns].copy()
-    replacement_comparison = validate_controlled_replacement(inputs["previous_model"], final)
+    comparison = compare_against_previous(read_csv_strings(args.compare_against), final) if args.compare_against else None
     manifest = build_manifest(final_columns)
     qa = build_QA_summary(
         inputs,
@@ -1370,7 +1286,7 @@ def main() -> None:
         merge_metrics,
         canonicalization,
         constant_exclusions,
-        replacement_comparison,
+        comparison,
     )
     run_final_assertions(backbone_invariants, inputs["backbone"], merged, final, vehicle)
     save_outputs(paths, final, manifest, qa)
@@ -1378,7 +1294,7 @@ def main() -> None:
     print_final_summary(
         paths,
         final,
-        replacement_comparison,
+        comparison,
     )
 
 

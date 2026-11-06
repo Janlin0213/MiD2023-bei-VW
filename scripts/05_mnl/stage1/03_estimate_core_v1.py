@@ -41,14 +41,14 @@ OUT = ROOT / "estimation"
 BASELINE_PATH = OUT / "review" / "core_v1_stage5_protected_baseline.json"
 PREDICTORS = tuple(prep.PREDICTORS)
 PARAMETERS = tuple("B_" + name[2:] for name in PREDICTORS)
-assert len(PREDICTORS) == len(PARAMETERS) == 24
+assert len(PREDICTORS) == len(PARAMETERS) == 26
 
 
 def verify_protected() -> dict:
     baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
     for section in ("stage1_files_and_code", "upstream_and_stage0"):
         for filename, expected in baseline[section].items():
-            if prep.sha256(Path(filename)) != expected:
+            if prep.sha256(prep.protected_path(filename)) != expected:
                 raise AssertionError(f"Protected {section} file changed: {filename}")
     return baseline
 
@@ -61,14 +61,12 @@ def load_accepted() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
                          dtype={key: "string" for key in prep.JOIN_KEYS}, low_memory=False)
     effective = pd.read_csv(data_dir / "core_v1_effective_design.csv",
                             dtype={"CHOICE_ID": "string", "H_ID": "string"}, low_memory=False)
-    if len(sample) != 20548 or sample.H_ID.nunique() != 16689:
-        raise AssertionError("Accepted Stage-1 N or household count differs from approved version")
     if len(sample) != metadata["sample"]["stage1_n"] or sample.H_ID.nunique() != metadata["sample"]["households"]:
         raise AssertionError("Stage-1 metadata/sample mismatch")
     if sample.CHOICE_ID.isna().any() or not sample.CHOICE_ID.is_unique or sample.H_ID.isna().any():
         raise AssertionError("Missing or repeated occasion/household identifiers")
     if list(effective.columns) != ["CHOICE_ID", "H_ID", "CHOICE", "AV_1", "AV_2", "W_GEW", *PREDICTORS]:
-        raise AssertionError("Frozen 24-column predictor names or order changed")
+        raise AssertionError(f"Frozen {len(PREDICTORS)}-column predictor names or order changed")
     if len(effective) != len(sample) or not effective.CHOICE_ID.equals(sample.CHOICE_ID):
         raise AssertionError("Stage-1 sample and difference-design rows differ")
     for name in ("H_ID", "CHOICE", "AV_1", "AV_2", "W_GEW"):
@@ -81,7 +79,7 @@ def load_accepted() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         raise AssertionError("W_GEW must be finite and positive")
     x = effective[list(PREDICTORS)].to_numpy(float)
     if not np.isfinite(x).all() or not np.allclose(x, prep.effective_design(sample).to_numpy(float), rtol=0, atol=1e-12):
-        raise AssertionError("Saved 24-column effective design failed independent reconstruction")
+        raise AssertionError(f"Saved {len(PREDICTORS)}-column effective design failed independent reconstruction")
     return sample, effective, metadata
 
 
@@ -296,7 +294,13 @@ def sensitivity_fit(label: str, mask: np.ndarray, sample: pd.DataFrame, x: np.nd
         summary.update(status="FAILED_RANK_DEFICIENT", message="No predictor removed")
         return pd.DataFrame(), summary
     fit = scipy_fit(x_sub, y_sub, w_sub, main_beta)
-    if (not np.isfinite(fit["beta"]).all() or
+    restarted_from_zero = False
+    if not fit["success"]:
+        restart = scipy_fit(x_sub, y_sub, w_sub, np.zeros(len(PREDICTORS)))
+        if restart["success"] and restart["ll"] >= fit["ll"] - 1e-5:
+            fit = restart
+            restarted_from_zero = True
+    if (not fit["success"] or not np.isfinite(fit["beta"]).all() or
             np.max(np.abs(fit["gradient"])) / w_sub.sum() > 1e-5):
         summary.update(status="FAILED_OPTIMIZATION", message=fit["message"])
         return pd.DataFrame(), summary
@@ -318,6 +322,7 @@ def sensitivity_fit(label: str, mask: np.ndarray, sample: pd.DataFrame, x: np.nd
                           "main_cluster_se": main_se, "sensitivity_cluster_se": se,
                           "cluster_se_change": se-main_se})
     summary.update(status="PASS", message=fit["message"], converged=fit["success"],
+                   restarted_from_zero=restarted_from_zero,
                    final_ll=fit["ll"], gradient_norm=float(np.linalg.norm(fit["gradient"])),
                    hessian_condition=covariance["hessian_condition"],
                    max_abs_coefficient_change=float(np.max(np.abs(difference))),
@@ -335,8 +340,8 @@ def estimate_main_model(name: str, weighted: bool, sample: pd.DataFrame,
     y = sample.CHOICE.eq(1).to_numpy(float)
     w = sample.W_GEW.to_numpy(float) if weighted else np.ones(len(sample))
     result, beta, raw = biogeme_fit(effective, weighted, f"core_v1_{name}")
-    if len(beta) != 24 or int(result.number_of_parameters) != 24:
-        raise AssertionError(f"Biogeme did not estimate all 24 coefficients: {name}")
+    if len(beta) != len(PARAMETERS) or int(result.number_of_parameters) != len(PARAMETERS):
+        raise AssertionError(f"Biogeme did not estimate all {len(PARAMETERS)} coefficients: {name}")
     check = validate_biogeme(result, beta, raw, x, y, w)
     biogeme_p = biogeme_probabilities(effective, beta)
     probability_error = float(np.max(np.abs(biogeme_p-check["probabilities"])))
@@ -380,7 +385,7 @@ def estimate_main_model(name: str, weighted: bool, sample: pd.DataFrame,
         "model": name, "weighted": weighted, "N": len(sample), "households": sample.H_ID.nunique(),
         "parameters": len(beta), "sum_weights": float(w.sum()),
         "weighting_method": "raw W_GEW observation weight; no normalization" if weighted else "each occasion weight 1",
-        "starting_values": "all 24 zero", "optimizer": raw.optimization_messages.get("Algorithm", "Biogeme default"),
+        "starting_values": f"all {len(PARAMETERS)} zero", "optimizer": raw.optimization_messages.get("Algorithm", "Biogeme default"),
         "optimizer_messages": json.dumps({key: value for key, value in raw.optimization_messages.items()
                                            if "time" not in key.lower()}, sort_keys=True, default=str),
         "converged": bool(result.algorithm_has_converged),
@@ -389,7 +394,7 @@ def estimate_main_model(name: str, weighted: bool, sample: pd.DataFrame,
         "final_ll": float(result.final_log_likelihood),
         "null_ll": float(result.null_log_likelihood),
         "rho_square": 1-float(result.final_log_likelihood)/float(result.null_log_likelihood),
-        "adjusted_rho_square": 1-(float(result.final_log_likelihood)-24)/float(result.null_log_likelihood),
+        "adjusted_rho_square": 1-(float(result.final_log_likelihood)-len(PARAMETERS))/float(result.null_log_likelihood),
         "AIC": float(result.akaike_information_criterion),
         "BIC": float(result.bayesian_information_criterion),
         "biogeme_gradient_norm": float(result.gradient_norm),
@@ -461,11 +466,11 @@ def interpretation_table(metadata: dict) -> pd.DataFrame:
 def rerun_stability(model: dict, x: np.ndarray, y: np.ndarray, w: np.ndarray) -> pd.DataFrame:
     stage0_file = OUTPUTS_DIR / "mnl" / "v1_only" / f"v1_only_{model['name']}_parameters.csv"
     stage0 = pd.read_csv(stage0_file).set_index("parameter")["estimate"]
-    stage0_start = np.zeros(24)
+    stage0_start = np.zeros(len(PARAMETERS))
     for i, parameter in enumerate(PARAMETERS[:7]):
         stage0_start[i] = float(stage0.loc[parameter])
     rows = []
-    for label, start in [("all_zero", np.zeros(24)), ("stage0_main_effects_then_zero_interactions", stage0_start)]:
+    for label, start in [("all_zero", np.zeros(len(PARAMETERS))), ("stage0_main_effects_then_zero_interactions", stage0_start)]:
         fit = scipy_fit(x, y, w, start)
         rows.append({"model": model["name"], "start": label, "optimizer": "SciPy trust-exact independent check",
                      "converged": fit["success"], "message": fit["message"],
@@ -497,9 +502,9 @@ def stage5_report(metadata: dict, sample: pd.DataFrame, models_out: dict,
     )
     lines = ["# Stage-5 Core–V1 estimation report", "", "**Decision: ESTIMATED_PENDING_MANUAL_REVIEW**", "",
              "## 1. Input version and specification", "",
-             "The protected Stage-1 context sample, effective design, transformations, pre-estimation QA, upstream inputs, and Stage-0 results matched their saved SHA-256 baseline before and after estimation. The complete baseline and output hashes are in the Stage-5 manifest. No accepted input was rebuilt.", "",
+             "The controlled canonical revision rebuilt Stage-1 from verified upstream inputs. Its context sample, effective design, diagnostics, and unchanged Stage-0 results matched the revised SHA-256 baseline before and after estimation. The current input and output hashes are retained in the Stage-5 manifest.", "",
              f"- N={len(sample):,} occasions; H_ID households={sample.H_ID.nunique():,}; both alternatives available for every occasion.",
-             f"- Frozen design: seven generic vehicle main effects and 17 context interactions, 24 free coefficients, no ASC or generic context main effect. Tour time remains centered at {metadata['centering_mean_minutes']:.6f} minutes.",
+             f"- Frozen design: seven generic vehicle main effects and {len(prep.INTERACTIONS)} context interactions, {len(PARAMETERS)} free coefficients, no ASC or generic context main effect. Tour time remains centered at {metadata['centering_mean_minutes']:.6f} minutes.",
              "- Primary model uses the original unnormalized `W_GEW` as an observation weight, consistent with Stage 0. Both main fits use the same rows and predictors.", "",
              "## 2. Main estimation and fit", "",
              "| Model | Converged | Final LL | Null LL | AIC | BIC | Independent gradient norm |", "|---|---|---:|---:|---:|---:|---:|",
@@ -509,11 +514,11 @@ def stage5_report(metadata: dict, sample: pd.DataFrame, models_out: dict,
              "The following uses weighted coefficients and uncorrected H_ID-clustered HC0 sandwich standard errors. Two-sided p<0.05 is counted descriptively and does not select predictors.", "",
              "| Parameter | Estimate | Cluster SE | z | p | 95% CI |", "|---|---:|---:|---:|---:|---|",
              *[f"| {r.parameter} | {r.estimate:.4f} | {r.standard_error:.4f} | {r.z:.3f} | {r.p_two_sided:.4g} | [{r.ci95_low:.4f}, {r.ci95_high:.4f}] |" for _, r in primary.iterrows()], "",
-             f"Descriptive p<0.05 count: {significant}/24. Full model-based, individual HC0, and household-cluster covariance matrices and parameter tables are saved separately. The largest absolute clustered-versus-individual-HC0 SE difference is {max_se_difference:.5f} for {max_se_row.parameter}.", "",
+             f"Descriptive p<0.05 count: {significant}/{len(PARAMETERS)}. Full model-based, individual HC0, and household-cluster covariance matrices and parameter tables are saved separately. The largest absolute clustered-versus-individual-HC0 SE difference is {max_se_difference:.5f} for {max_se_row.parameter}.", "",
              "## 4. Numerical and covariance validation", "",
              f"- Independent LL discrepancy: unweighted {unweighted['validation']['ll_abs_difference']:.3g}; weighted {weighted['validation']['ll_abs_difference']:.3g}. Independent gradient, negative Hessian, and Biogeme predicted probabilities also agree within the recorded tolerances.",
              f"- Biogeme's built-in weighted robust covariance differs from the observation-level HC0 defined here (largest matrix entry difference {weighted['validation']['HC0_covariance_max_abs_difference_from_biogeme']:.5f}). Its BHHH meat matches one factor of `W_GEW` (max difference {weighted['validation']['biogeme_BHHH_minus_w_linear_score_meat_max_abs']:.3g}), while the requested weighted pseudo-score `s_i=W_GEW_i D_i(y_i-p_i)` gives squared weights in individual HC0 and household-summed scores in clustered HC0. The unweighted matrices agree to {unweighted['validation']['HC0_covariance_max_abs_difference_from_biogeme']:.3g}. The weighted Biogeme robust covariance is therefore not substituted for the specified sandwich.",
-             f"- Weighted observed-information condition number: {weighted['hessian']['information_condition_number']:.4g}; smallest eigenvalue: {weighted['hessian']['min_information_eigenvalue']:.4g}. Largest absolute clustered parameter correlation: {weighted['hessian']['max_abs_parameter_correlation']:.4f} ({weighted['hessian']['parameter_1']}, {weighted['hessian']['parameter_2']}). The pre-estimation scaled design condition number was 6.59 and measures a different property.",
+             f"- Weighted observed-information condition number: {weighted['hessian']['information_condition_number']:.4g}; smallest eigenvalue: {weighted['hessian']['min_information_eigenvalue']:.4g}. Largest absolute clustered parameter correlation: {weighted['hessian']['max_abs_parameter_correlation']:.4f} ({weighted['hessian']['parameter_1']}, {weighted['hessian']['parameter_2']}). The revised pre-estimation scaled design condition number is recorded in the diagnostics and measures a different property.",
              f"- Household score aggregation: {weighted['cluster']['households']:,} clusters; {weighted['cluster']['multi_occasion_households']:,} have multiple occasions; household counts sum to N. No pseudo-inverse or finite-cluster correction was used.",
              f"- Independent zero and Stage-0-start refits: maximum coefficient discrepancy {restarts.max_abs_beta_difference_from_biogeme.max():.4g}; see optimization diagnostics. Biogeme 3.3.3 and SciPy versions are recorded in fit files.", "",
              "## 5. Predictions and label invariance", "",
@@ -521,16 +526,16 @@ def stage5_report(metadata: dict, sample: pd.DataFrame, models_out: dict,
              f"- Vehicle-label swap: {label_qa['status']}. Maximum probability error={label_qa['probability_max_abs_error']:.3g}; max coefficient discrepancy after swapped refit={label_qa['refit_beta_max_abs_error']:.3g}. Individual chosen-alternative probabilities, LL contributions, and scores were checked.", "",
              "## 6. Prespecified sensitivity analyses", "",
              "| Subset | Excluded | N | Rank | Status | Largest absolute coefficient change | Sign changes |", "|---|---:|---:|---:|---|---:|---:|",
-             *[f"| {s['sensitivity']} | {s['excluded_n']:,} | {s['n']:,} | {s['rank']}/24 | {s['status']} | {s.get('max_abs_coefficient_change', float('nan')):.4f} | {s.get('sign_changes', 'NA')} |" for s in sensitivities], "",
-             f"Both subsets are temporary in-memory sensitivity checks. The original 24 columns and full-sample time-centering mean were retained. They do not redefine the primary sample or authorize future exclusions. The largest age-tail coefficient change is {age_s.get('max_abs_coefficient_change', float('nan')):.4f}; the largest long-tour change is {long_s.get('max_abs_coefficient_change', float('nan')):.4f}. Sign changes in the long-tour subset: {flip_text}. A sign change near zero relative to its clustered SE does not support a stable directional claim.", "",
+             *[f"| {s['sensitivity']} | {s['excluded_n']:,} | {s['n']:,} | {s['rank']}/{len(PARAMETERS)} | {s['status']} | {s.get('max_abs_coefficient_change', float('nan')):.4f} | {s.get('sign_changes', 'NA')} |" for s in sensitivities], "",
+             f"Both subsets are temporary in-memory sensitivity checks. The original {len(PARAMETERS)} columns and full-sample time-centering mean were retained. They do not redefine the primary sample or authorize future exclusions. The largest age-tail coefficient change is {age_s.get('max_abs_coefficient_change', float('nan')):.4f}; the largest long-tour change is {long_s.get('max_abs_coefficient_change', float('nan')):.4f}. Sign changes in the long-tour subset: {flip_text}. A sign change near zero relative to its clustered SE does not support a stable directional claim.", "",
              "## 7. Interpretation and limitations", "",
-             "The BEV main effect refers to the modeled baseline context: mean tour time, 0–1 stops, no household companion, male driver, under 65, non-family household, and rural region, while holding segment and vehicle age constant. LARGE and vehicle-age main effects likewise depend on their included interactions. `B_TIME_PHEV` and `B_TIME_BEV` change the corresponding powertrain contrast per additional tour hour; vehicle-age slopes are per vehicle year. The interpretation CSV gives every parameter's formula and unit.", "",
+             "The BEV main effect refers to the modeled baseline context: mean tour time, 0–1 stops, no confirmed household companion during focal-person tour driving, male driver, age 30–49, non-family household, and rural region, while holding segment and vehicle age constant. LARGE and vehicle-age main effects likewise depend on their included interactions. `B_TIME_PHEV` and `B_TIME_BEV` change the corresponding powertrain contrast per additional tour hour; vehicle-age slopes are per vehicle year. The interpretation CSV gives every parameter's formula and unit.", "",
              f"In the weighted fit, the baseline-context BEV contrast is {primary.set_index('parameter').loc['B_PT_BEV', 'estimate']:.3f} (conditional odds multiplier {math.exp(primary.set_index('parameter').loc['B_PT_BEV', 'estimate']):.2f}); the household-accompanied increment to the LARGE contrast is {primary.set_index('parameter').loc['B_HHACCOMP_LARGE', 'estimate']:.3f}; and the female increment to LARGE is {primary.set_index('parameter').loc['B_FEMALE_LARGE', 'estimate']:.3f}. The baseline vehicle-age slope is {primary.set_index('parameter').loc['B_VEHICLE_AGE', 'estimate']:.4f} per vehicle year. These terms are conditional on the other modeled interactions and are not population-wide unconditional effects.", "",
-             "These are observational vehicle-use associations. Realized tour time and stops may be jointly determined with vehicle choice. Household clustering allows within-household score correlation but does not estimate random preferences, resolve allocation constraints or endogeneity, or fully represent MiD's complex survey design. Odds ratios and illustrative pair-choice probabilities are conditional model quantities, not purchase probabilities or market shares.", "",
+             "These are observational vehicle-use associations. Realized tour-driving accompaniment, tour time and stops may be jointly determined with vehicle choice. Household clustering allows within-household score correlation but does not estimate random preferences, resolve allocation constraints or endogeneity, or fully represent MiD's complex survey design. Odds ratios and illustrative pair-choice probabilities are conditional model quantities, not purchase probabilities or market shares.", "",
              "## 8. Manual review", "",
              f"- Automated tests: {test_result['status']} ({test_result['tests_run']} tests).", 
              *[f"- REVIEW: {warning}" for warning in warnings],
-             "- PASS: frozen inputs and 24-column design verified; independent objective and covariance checks completed.",
+             f"- PASS: frozen inputs and {len(PARAMETERS)}-column design verified; independent objective and covariance checks completed.",
              "- BLOCKER: none detected in the completed primary estimation.",
              "- Final thesis model selection and substantive interpretation remain subject to manual review. No Core–V2 or later-stage model was started.", ""]
     return "\n".join(lines)
@@ -610,8 +615,9 @@ def main() -> None:
 
     age_exclude = (sample.VEHICLE_AGE_1-sample.VEHICLE_AGE_2).abs().gt(40).to_numpy()
     long_exclude = sample.TOUR_TRAVEL_TIME_MIN.gt(240).to_numpy()
-    if age_exclude.sum() != 87:
-        raise AssertionError(f"Expected accepted >40-year age QA count 87; observed {age_exclude.sum()}")
+    age_qa = pd.read_csv(ROOT / "diagnostics" / "core_v1_vehicle_age_extreme_summary.csv")
+    if age_exclude.sum() != int(age_qa.iloc[0].abs_difference_gt40_n):
+        raise AssertionError("Vehicle-age sensitivity count differs from revised Stage-1 diagnostics")
     sensitivity_results = []
     main_cluster_cov = weighted["covariance"]["covariances"]["HID_cluster_HC0"]
     for label, mask, filename in [
@@ -647,9 +653,9 @@ def main() -> None:
             warnings.append(f"{summary['sensitivity']} sensitivity unresolved: {summary['status']}")
     warnings.extend([
         "Biogeme weighted built-in robust covariance uses linear-weight BHHH and differs from squared-weight pseudo-score HC0; specified H_ID-clustered covariance is primary",
-        "87 >40-year vehicle-age contrasts remain in the full-sample primary fit; original construction years await upstream validation",
-        "PHEV contrasts above 240 tour minutes are sparse (43); the long-tour sensitivity is reported separately",
-        "All 17 interaction subsets had descriptive Kish/N below 0.5 in pre-estimation QA; this is not a design-based effective sample size",
+        f"{int(age_exclude.sum())} >40-year vehicle-age contrasts remain in the full-sample primary fit; original construction years await upstream validation",
+        f"PHEV contrasts above 240 tour minutes: {int(((sample.PT1_PHEV != sample.PT2_PHEV) & sample.TOUR_TRAVEL_TIME_MIN.gt(240)).sum())}; the long-tour sensitivity is reported separately",
+        f"All {len(prep.INTERACTIONS)} interaction subsets had descriptive Kish/N below 0.5 in pre-estimation QA; this is not a design-based effective sample size",
     ])
     (OUT / "review" / "core_v1_stage5_warnings.json").write_text(json.dumps(warnings, indent=2), encoding="utf-8")
 
@@ -660,7 +666,7 @@ def main() -> None:
     (OUT / "review" / "core_v1_stage5_manual_review_checklist.md").write_text(
         "# Stage-5 Core–V1 manual review checklist\n\nDecision: ESTIMATED_PENDING_MANUAL_REVIEW\n\n"
         + "\n".join(f"- [ ] {item}" for item in [
-            "Protected input hashes and exact 24-column design reviewed",
+            f"Protected input hashes and exact {len(PARAMETERS)}-column design reviewed",
             "Biogeme convergence and independent objective validation reviewed",
             "Weighted H_ID-clustered parameter table and uncertainty reviewed",
             "Weighted versus unweighted fit interpretation reviewed",
@@ -676,7 +682,7 @@ def main() -> None:
     verify_protected()
     output_files = sorted(p for p in OUT.rglob("*") if p.is_file() and p.name != "core_v1_stage5_manifest.json")
     manifest = {"decision_status": "ESTIMATED_PENDING_MANUAL_REVIEW",
-                "protected_baseline_path": str(BASELINE_PATH.resolve()),
+                "protected_baseline_path": prep.repo_relative(BASELINE_PATH),
                 "protected_file_count": len(baseline["stage1_files_and_code"]) + len(baseline["upstream_and_stage0"]),
                 "stage5_script_sha256": prep.sha256(Path(__file__)),
                 "input_N": len(sample), "households": sample.H_ID.nunique(),
@@ -684,12 +690,12 @@ def main() -> None:
                 "biogeme_version": get_biogeme_version(),
                 "test_result": test_result, "label_invariance": invariance_details,
                 "sensitivity_statuses": sensitivity_results,
-                "output_file_sha256": {str(path.resolve()): prep.sha256(path) for path in output_files}}
+                "output_file_sha256": {prep.repo_relative(path): prep.sha256(path) for path in output_files}}
     (OUT / "review" / "core_v1_stage5_manifest.json").write_text(
         json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     primary = weighted["tables"]["HID_cluster_HC0"]
     se_diff = np.abs(primary.standard_error.to_numpy()-weighted["tables"]["individual_HC0"].standard_error.to_numpy())
-    print(f"N={len(sample):,}; households={sample.H_ID.nunique():,}; coefficients=24; Biogeme={get_biogeme_version()}")
+    print(f"N={len(sample):,}; households={sample.H_ID.nunique():,}; coefficients={len(PARAMETERS)}; Biogeme={get_biogeme_version()}")
     print(f"Converged: U={unweighted['fit']['converged']}, W={weighted['fit']['converged']}; LL: U={unweighted['fit']['final_ll']:.6f}, W={weighted['fit']['final_ll']:.6f}")
     print(f"Weighted gradient norm={weighted['fit']['independent_gradient_norm']:.6g}; Hessian condition={weighted['hessian']['information_condition_number']:.6g}; max |parameter correlation|={weighted['hessian']['max_abs_parameter_correlation']:.4f}")
     print(f"Primary clustered p<.05 descriptive count={int(primary.p_two_sided.lt(.05).sum())}; largest HC0-vs-cluster SE difference={se_diff.max():.6g} ({PARAMETERS[int(se_diff.argmax())]})")

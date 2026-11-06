@@ -1,7 +1,7 @@
 """Canonical candidates for the baseline household vehicle-choice MNL input.
 
-This registry deliberately contains one preferred representation per modelling
-construct. It is not the selected-raw extraction universe. Variables kept only
+This registry contains model-ready candidates; the three raw purpose variables
+remain separate candidates for later specification choice. It is not the selected-raw extraction universe. Variables kept only
 for reconstruction, QA, realised-choice leakage, closed-tour sensitivity, or
 later route/OD extensions are intentionally absent.
 
@@ -31,9 +31,11 @@ MNL_ATTRIBUTE_CANDIDATES = {
             "TOUR_N_DISTINCT_PURPOSES",
         ],
         "purpose": [
-            # TOUR_FIRST_PURPOSE replaces W_ZWECK/zweck/hwzweck*/LEG_PURPOSE.
+            # Keep all three raw purpose candidates for later specification choice.
             # OTHER is retained because Phase 6 implements it for purpose 10.
             "TOUR_FIRST_PURPOSE",
+            "TOUR_MAIN_PURPOSE",
+            "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2",
             "TOUR_HAS_WORK",
             "TOUR_HAS_BUSINESS",
             "TOUR_HAS_EDUCATION",
@@ -123,7 +125,7 @@ MNL_ATTRIBUTE_CANDIDATES = {
 
 
 # Deliberately deferred extensions (not baseline registry entries):
-# - TOUR_MAIN_PURPOSE and TOUR_ELAPSED_TIME_MIN: closed-tour sensitivity only.
+# - TOUR_ELAPSED_TIME_MIN: closed-tour sensitivity only.
 # - route/OD mode distances and durations: later accessibility extension.
 # - origin/destination spatial classifications: later trip-spatial extension.
 # - HOME_CHARGING, DRIVING_EXPERIENCE_YEARS, P_ARB_ENTF, hoff1,

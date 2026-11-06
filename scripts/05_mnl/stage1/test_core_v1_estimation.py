@@ -100,9 +100,10 @@ class Stage5NumericalTests(unittest.TestCase):
     def test_frozen_input_validation(self):
         before = stage5.verify_protected()
         sample, effective, metadata = stage5.load_accepted()
-        self.assertEqual(len(sample), 20548)
-        self.assertEqual(sample.H_ID.nunique(), 16689)
-        self.assertEqual(list(effective.columns[-24:]), list(stage5.PREDICTORS))
+        self.assertEqual(len(sample), metadata["sample"]["stage1_n"])
+        self.assertEqual(sample.H_ID.nunique(), metadata["sample"]["households"])
+        self.assertEqual(len(stage5.PREDICTORS), 26)
+        self.assertEqual(list(effective.columns[-len(stage5.PREDICTORS):]), list(stage5.PREDICTORS))
         self.assertEqual(before, stage5.verify_protected())
 
 

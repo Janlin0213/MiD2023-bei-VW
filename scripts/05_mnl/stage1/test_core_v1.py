@@ -8,6 +8,7 @@ import unittest
 
 import numpy as np
 import pandas as pd
+from src.thesis_pipeline.model_input import tour_features
 
 HERE = Path(__file__).resolve().parent
 for ancestor in HERE.parents:
@@ -26,6 +27,7 @@ def import_file(name: str, path: Path):
 
 prep = import_file("test_prepare_core_v1", HERE / "01_prepare_core_v1.py")
 diagnose = import_file("test_diagnose_core_v1", HERE / "02_diagnose_core_v1.py")
+encoder = import_file("test_single_driver_age_registry", HERE.parents[1] / "03_model_input" / "05_build_single_driver_mnl_design_matrix.py")
 
 
 def example_context() -> pd.DataFrame:
@@ -34,10 +36,14 @@ def example_context() -> pd.DataFrame:
         "TOUR_N_NONHOME_STOPS": [0, 1, 2, 3],
         "HOUSEHOLD_ACCOMPANIED": [0, 1, 0, 1],
         "HP_SEX": [1, 2, 1, 2],
-        "alter_gr5": [3, 12, 13, 15],
+        "alter_gr5": [4, 8, 11, 15],
         "household_type": ["young_household", "family_household", "adult_household", "senior_household"],
         "RegioStaR4": [11, 12, 21, 22],
-    })
+    }).pipe(lambda frame: pd.concat([
+        frame,
+        encoder.apply_categorical(frame.assign(CHOICE_ID=["a", "b", "c", "d"]),
+            next(spec for spec in encoder.TRANSFORMATION_REGISTRY if spec.key == "age_band"))[0]
+    ], axis=1))
 
 
 def example_vehicle() -> pd.DataFrame:
@@ -54,12 +60,71 @@ def example_vehicle() -> pd.DataFrame:
 
 
 class CoreV1Tests(unittest.TestCase):
+    def test_script05_age_registry_and_stage1_mapping(self):
+        codes = [3, *range(4, 16), None]
+        frame = pd.DataFrame({"CHOICE_ID": [str(i) for i in range(len(codes))],
+                              "alter_gr5": codes})
+        spec = next(item for item in encoder.TRANSFORMATION_REGISTRY if item.key == "age_band")
+        self.assertEqual(spec.recommended_reference, "AGE_30_49")
+        encoded, _ = encoder.apply_categorical(frame, spec)
+        self.assertEqual(encoded[prep.AGE_COLUMNS].sum(axis=1).tolist(), [1] * len(codes))
+        self.assertEqual(encoded.AGE_UNDER18.tolist(), [1] + [0] * 13)
+        self.assertEqual(encoded.AGE_UNDER30.tolist(), [0, 1, 1] + [0] * 11)
+        self.assertEqual(encoded.AGE_30_49.tolist(), [0] * 3 + [1] * 4 + [0] * 7)
+        self.assertEqual(encoded.AGE_50PLUS.tolist(), [0] * 7 + [1] * 6 + [0])
+        self.assertEqual(encoded.AGE_MISSING.tolist(), [0] * 13 + [1])
+        checked = pd.concat([frame, encoded], axis=1)
+        checked["TOUR_TRAVEL_TIME_MIN"] = 60
+        checked["TOUR_N_NONHOME_STOPS"] = 1
+        checked["HOUSEHOLD_ACCOMPANIED"] = 0
+        checked["HP_SEX"] = 1
+        checked["household_type"] = "family_household"
+        checked["RegioStaR4"] = 11
+        result, _ = prep.encode_context(checked)
+        self.assertTrue(result.loc[0, "under18_driver"])
+        self.assertFalse(result.loc[1, "under18_driver"])
+        self.assertTrue(result.loc[len(codes)-1, "invalid_age"])
+        checked.loc[1, "AGE_UNDER30"] = 0
+        with self.assertRaisesRegex(AssertionError, "disagrees"):
+            prep.encode_context(checked)
+
+    def test_tour_driving_accompaniment_truth_table(self):
+        cases = [
+            ("yes_late", [1, 1, 1], [2, 716, 1], 1),
+            ("all_no", [1, 1, 1], [2, 716, 2], 0),
+            ("unknown_response", [1, 1], [2, 999], None),
+            ("yes_over_unknown", [1, 1], [1, 999], 1),
+            ("passenger_only", [2], [1], None),
+            ("noncar_only", [706], [1], None),
+            ("ambiguous_driver", [1, 3], [2, 2], None),
+            ("missing_driver", [1, None], [2, 2], None),
+        ]
+        rows = []
+        for name, statuses, companions, _ in cases:
+            for index, (status, companion) in enumerate(zip(statuses, companions)):
+                rows.append({"TOUR_ID": name, "PERSON_KEY": name,
+                             "SOURCE_ROW_ID": f"{name}-{index}",
+                             "pkw_fmf": status, "W_BEGL_HH": companion})
+        result = tour_features.tour_household_accompaniment(pd.DataFrame(rows))
+        for name, _, _, expected in cases:
+            if expected is None:
+                self.assertTrue(pd.isna(result[name]))
+            else:
+                self.assertEqual(result[name], expected)
+        mixed = pd.DataFrame(rows)
+        mixed.loc[mixed.TOUR_ID.eq("all_no"), "PERSON_KEY"] = "different_person"
+        mixed.loc[mixed.SOURCE_ROW_ID.eq("all_no-0"), "PERSON_KEY"] = "all_no"
+        with self.assertRaisesRegex(AssertionError, "different persons"):
+            tour_features.tour_household_accompaniment(mixed)
+
     def test_context_references_and_stop_zero(self):
         encoded, mean = prep.encode_context(example_context())
         self.assertEqual(mean, 75)
         self.assertEqual(encoded.MULTISTOP.tolist(), [0, 0, 1, 1])
         self.assertEqual(encoded.FEMALE.tolist(), [0, 1, 0, 1])
-        self.assertEqual(encoded.OLDER65.tolist(), [0, 0, 1, 1])
+        self.assertEqual(encoded.AGE_UNDER30.tolist(), [1, 0, 0, 0])
+        self.assertEqual(encoded.AGE_30_49.tolist(), [0, 1, 0, 0])
+        self.assertEqual(encoded.AGE_50PLUS.tolist(), [0, 0, 1, 1])
         self.assertEqual(encoded.FAMILY.tolist(), [0, 1, 0, 0])
         self.assertEqual(encoded.URBAN_REGION.tolist(), [1, 1, 0, 0])
         self.assertEqual(encoded.TOUR_TIME_C_H.tolist(), [-.75, -.25, .25, .75])
@@ -87,8 +152,8 @@ class CoreV1Tests(unittest.TestCase):
         second = prep.effective_design(frame)
         pd.testing.assert_frame_equal(first, second)
         self.assertEqual(list(first), prep.PREDICTORS)
-        self.assertEqual(first.shape[1], 24)
-        self.assertEqual(len(prep.INTERACTIONS), 17)
+        self.assertEqual(first.shape[1], 26)
+        self.assertEqual(len(prep.INTERACTIONS), 19)
         for name, left, right in prep.MAIN:
             np.testing.assert_array_equal(first[name], frame[left] - frame[right])
         for name, context, target in prep.INTERACTIONS:

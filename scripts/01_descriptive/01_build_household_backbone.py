@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
             break
 
 from src.thesis_pipeline.paths import SELECTED_RAW_DIR, THEME1_BACKBONE_DIR
+from src.thesis_pipeline.features.household_type import build_household_type
 
 HOUSEHOLDS_PATH = SELECTED_RAW_DIR / "hh_selected_raw.csv"
 PERSONS_PATH = SELECTED_RAW_DIR / "persons_selected_raw.csv"
@@ -35,12 +36,20 @@ HOUSEHOLD_COLUMNS = [
     "H_GR",
     "H_ANZAUTO",
     "RegioStaR4",
-    "household_type",
+    "RegioStaR7",
 ]
-PERSON_COLUMNS = ["H_ID", "P_ID", "P_FS_PKW"]
+PERSON_COLUMNS = ["H_ID", "P_ID", "P_FS_PKW", "alter_gr5"]
 
 CAR_GROUP_MAP = {1: "single_car", 2: "multi_car", 3: "multi_car"}
 REGIOSTAR4_ORDER = [11, 12, 21, 22]
+# The historical three-group coding is uniquely recovered from the accepted
+# habitual-use spatial counts (all 30 outcome-by-car cells) and the MiD codebook's
+# RegioStaR7 codes 71–77; it is independent of the Core-V1 RegioStaR4 coding.
+REGIOSTAR7_TO_SPATIAL_CONTEXT_3 = {
+    71: "urban_core", 72: "urban_core", 73: "intermediate_urban",
+    74: "small_town_rural", 75: "urban_core",
+    76: "intermediate_urban", 77: "small_town_rural",
+}
 HOUSEHOLD_TYPE_ORDER = [
     "family_household",
     "young_household",
@@ -68,12 +77,6 @@ def require_columns(columns: list[str], required: list[str], source: str) -> Non
     missing = sorted(set(required).difference(columns))
     if not missing:
         return
-    if source == "household" and "household_type" in missing:
-        raise RuntimeError(
-            "hh_selected_raw.csv is missing 'household_type'. Run the upstream "
-            "household-type construction step "
-            "(uv run python -m src.thesis_pipeline.features.household_type) first."
-        )
     raise KeyError(f"{source} input is missing required column(s): {missing}")
 
 
@@ -158,7 +161,7 @@ def read_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
     households = pd.read_csv(
         HOUSEHOLDS_PATH,
         usecols=HOUSEHOLD_COLUMNS,
-        dtype={"H_ID": "string", "H_GEW": "string", "household_type": "string"},
+        dtype={"H_ID": "string", "H_GEW": "string"},
         low_memory=False,
     )
     persons = pd.read_csv(
@@ -265,6 +268,13 @@ def construct_backbone(
 
     backbone["person_roster_present_flag"] = backbone["_person_merge"].eq("both").astype("int8")
     backbone = backbone.drop(columns="_person_merge")
+    household_types = build_household_type(persons)
+    if household_types.H_ID.isna().any() or not household_types.H_ID.is_unique:
+        raise AssertionError("Reconstructed household-type identifiers are invalid")
+    backbone = backbone.merge(household_types, on="H_ID", how="left", validate="one_to_one", sort=False)
+    if len(backbone) != len(households):
+        raise AssertionError("Household-type merge changed the household row count")
+    backbone["household_type"] = backbone["household_type"].fillna("unknown")
     for column in ["n_person_records", *LICENSE_COUNT_COLUMNS]:
         backbone[column] = numeric(backbone[column]).astype("Int64")
 
@@ -286,6 +296,14 @@ def construct_backbone(
     backbone["H_GEW"] = numeric(backbone["H_GEW"])
     backbone["H_ANZAUTO"] = numeric(backbone["H_ANZAUTO"]).astype("Int64")
     backbone["RegioStaR4"] = numeric(backbone["RegioStaR4"]).astype("Int64")
+    spatial_codes = numeric(backbone["RegioStaR7"])
+    if (backbone["RegioStaR7"].notna() & spatial_codes.isna()).any():
+        raise RuntimeError("RegioStaR7 contains a nonnumeric source code")
+    backbone["RegioStaR7"] = spatial_codes.astype("Int64")
+    unexpected_spatial = backbone["RegioStaR7"].notna() & ~backbone["RegioStaR7"].isin(REGIOSTAR7_TO_SPATIAL_CONTEXT_3)
+    if unexpected_spatial.any():
+        raise RuntimeError(f"Unmapped RegioStaR7 codes: {backbone.loc[unexpected_spatial, 'RegioStaR7'].value_counts().to_dict()}")
+    backbone["spatial_context_3"] = backbone["RegioStaR7"].map(REGIOSTAR7_TO_SPATIAL_CONTEXT_3)
 
     backbone["car_ownership_group"] = backbone["H_ANZAUTO"].map(CAR_GROUP_MAP)
     backbone["exact_car_count_flag"] = backbone["H_ANZAUTO"].isin([1, 2]).astype("int8")
@@ -309,6 +327,8 @@ def construct_backbone(
         "car_ownership_group",
         "exact_car_count_flag",
         "RegioStaR4",
+        "RegioStaR7",
+        "spatial_context_3",
         "household_type",
         "n_person_records",
         "person_roster_present_flag",
@@ -395,6 +415,8 @@ def build_qa(
     )
 
     rows.extend(distribution_rows("spatial_context", "RegioStaR4 distribution", backbone["RegioStaR4"]))
+    rows.extend(distribution_rows("spatial_context", "RegioStaR7 distribution", backbone["RegioStaR7"]))
+    rows.extend(distribution_rows("spatial_context", "spatial_context_3 distribution", backbone["spatial_context_3"]))
     rows.extend(
         [
             qa_row("spatial_context", "valid expected RegioStaR4 codes", count=int(backbone["RegioStaR4"].isin(REGIOSTAR4_ORDER).sum())),

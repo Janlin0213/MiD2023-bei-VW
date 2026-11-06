@@ -52,6 +52,10 @@ IDENTIFIER_COLUMNS = ["CHOICE_ID", "SOURCE_ROW_ID", "H_ID", "HP_ID", "P_ID", "W_
 CHOICE_CONTROL_COLUMNS = ["CHOICE", "AV_1", "AV_2", "W_GEW"]
 BRANCH_COLUMNS = ["SINGLE_ACTIVE_DRIVER_HH", "MULTI_ACTIVE_DRIVER_HH"]
 CONTROL_COLUMNS = [*IDENTIFIER_COLUMNS, *CHOICE_CONTROL_COLUMNS, *BRANCH_COLUMNS]
+PURPOSE_PASSTHROUGH_COLUMNS = [
+    "TOUR_FIRST_PURPOSE", "TOUR_MAIN_PURPOSE", "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2",
+]
+PURPOSE_EXTENSION_KEYS = ("main_purpose", "longest_purpose")
 
 
 @dataclass(frozen=True)
@@ -758,20 +762,19 @@ def build_transformation_registry() -> tuple[TransformSpec, ...]:
                 attribute="Age group",
                 source="alter_gr5",
                 block=person,
-                recommended="Regroup narrow codes 3–15 into broad age bands; never use the source code linearly.",
+                recommended="Regroup valid codes into Under 18, 18–29, 30–49 and 50+; use AGE_30_49 as the estimation reference while retaining its indicator in this full encoded feature set.",
                 categories=rules(
                     [
                         ("AGE_UNDER18", "Under 18", (3,)),
-                        ("AGE_18_34", "Age 18–34", (4, 5, 6)),
-                        ("AGE_35_49", "Age 35–49", (7, 8, 9)),
-                        ("AGE_50_64", "Age 50–64", (10, 11, 12)),
-                        ("AGE_65PLUS", "Age 65+", (13, 14, 15)),
+                        ("AGE_UNDER30", "Age 18–29", (4, 5)),
+                        ("AGE_30_49", "Age 30–49", (6, 7, 8, 9)),
+                        ("AGE_50PLUS", "Age 50+", (10, 11, 12, 13, 14, 15)),
                     ]
                 ),
-                implementation="Map code 3 to Under 18; 4–6 to 18–34; 7–9 to 35–49; 10–12 to 50–64; 13–15 to 65+.",
+                implementation="Map code 3 to Under 18; 4–5 to 18–29; 6–9 to 30–49; 10–15 to 50+; retain all four indicators and AGE_MISSING.",
                 missing="Do not impute; encode missing values with AGE_MISSING.",
                 use="Baseline candidate",
-                reference="AGE_35_49",
+                reference="AGE_30_49",
                 notes="Under 18 is rare and requires support review.",
                 missing_column="AGE_MISSING",
                 grouping_qa=True,
@@ -1031,6 +1034,24 @@ def build_transformation_registry() -> tuple[TransformSpec, ...]:
             ),
         ]
     )
+    for key, source, prefix, attribute in [
+        ("main_purpose", "TOUR_MAIN_PURPOSE", "MAIN_PURPOSE", "Official closing-trip main purpose"),
+        ("longest_purpose", "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2", "LONGEST_PURPOSE",
+         "Longest identifiable household-driver trip purpose"),
+    ]:
+        registry.append(_categorical(
+            key=key, attribute=attribute, source=source, block=tour,
+            recommended="Use as a candidate categorical representation with an explicit reference.",
+            categories=rules([(f"{prefix}_{label}", label.title(), (code,))
+                              for code, label in enumerate(
+                                  ("WORK", "BUSINESS", "EDUCATION", "SHOPPING", "ERRAND", "LEISURE", "ESCORT"), 1)]),
+            implementation="Seven official hwzweck2 categories plus a missing indicator; exact 1-of-8.",
+            missing="Missing is explicit and never imputed to a substantive purpose.",
+            use="Candidate only; not selected for Core-V1",
+            reference="To be chosen for a future specification",
+            notes="hwzweck2 codes 6=Leisure, 7=Escort; first-trip W_ZWECK uses 6=Escort, 7=Leisure.",
+            missing_column=f"{prefix}_MISSING", grouping_qa=True,
+        ))
     return tuple(registry)
 
 
@@ -1093,6 +1114,8 @@ def validate_registry(registry: Sequence[TransformSpec]) -> None:
     if len(keys) != len(set(keys)):
         raise AssertionError("Transformation registry keys must be unique.")
     feature_columns(registry)
+    if tuple(spec.key for spec in registry[-len(PURPOSE_EXTENSION_KEYS):]) != PURPOSE_EXTENSION_KEYS:
+        raise AssertionError("Purpose extension must follow all legacy registry features.")
 
     symmetry: dict[str, list[str]] = {}
     for spec in registry:
@@ -1107,7 +1130,7 @@ def validate_registry(registry: Sequence[TransformSpec]) -> None:
 
 def select_single_driver_branch(source: pd.DataFrame) -> pd.DataFrame:
     required_sources = [field for spec in TRANSFORMATION_REGISTRY for field in spec.source_fields]
-    require_columns(source.columns, [*CONTROL_COLUMNS, *required_sources], "candidate input")
+    require_columns(source.columns, [*CONTROL_COLUMNS, *required_sources, *PURPOSE_PASSTHROUGH_COLUMNS], "candidate input")
     if source["CHOICE_ID"].eq("").any() or not source["CHOICE_ID"].is_unique:
         raise ValueError("Candidate CHOICE_ID must be populated and unique.")
 
@@ -1331,7 +1354,20 @@ def validate_and_build(
     if not features.equals(repeat_features) or states != repeat_states:
         raise AssertionError("Transformation registry is not deterministic.")
 
-    final = pd.concat([retained[CONTROL_COLUMNS].copy(), features], axis=1)
+    encoded_columns = feature_columns(TRANSFORMATION_REGISTRY)
+    if set(PURPOSE_PASSTHROUGH_COLUMNS).intersection([*CONTROL_COLUMNS, *encoded_columns]):
+        raise AssertionError("Purpose passthrough duplicates a control or encoded column.")
+    for column in PURPOSE_PASSTHROUGH_COLUMNS:
+        values = retained[column].astype("string").str.strip().fillna("")
+        allowed = set(range(1, 17)) if column == "TOUR_FIRST_PURPOSE" else set(range(1, 8))
+        invalid = values.ne("") & ~numeric(values).isin(allowed)
+        if invalid.any():
+            raise ValueError(f"Invalid raw purpose codes in {column}: {values.loc[invalid].head().tolist()}")
+    extension_columns = feature_columns(TRANSFORMATION_REGISTRY[-len(PURPOSE_EXTENSION_KEYS):])
+    legacy_columns = [column for column in encoded_columns if column not in extension_columns]
+    final = pd.concat([retained[CONTROL_COLUMNS].copy(), features[legacy_columns],
+                       retained[PURPOSE_PASSTHROUGH_COLUMNS].copy(),
+                       features[extension_columns]], axis=1)
     expected_ids = set(
         source.loc[
             numeric(source["SINGLE_ACTIVE_DRIVER_HH"]).eq(1), "CHOICE_ID"
@@ -1347,8 +1383,11 @@ def validate_and_build(
         raise AssertionError("Output contains multi-driver rows.")
     if not final[CONTROL_COLUMNS].equals(retained[CONTROL_COLUMNS]):
         raise AssertionError("An identifier/control value or its source order changed.")
-    if list(final.columns) != [*CONTROL_COLUMNS, *feature_columns(TRANSFORMATION_REGISTRY)]:
+    if list(final.columns) != [*CONTROL_COLUMNS, *legacy_columns,
+                               *PURPOSE_PASSTHROUGH_COLUMNS, *extension_columns]:
         raise AssertionError("Final column order differs from the documented registry order.")
+    if not final[PURPOSE_PASSTHROUGH_COLUMNS].equals(retained[PURPOSE_PASSTHROUGH_COLUMNS]):
+        raise AssertionError("Purpose passthrough differs from the CHOICE_ID-aligned candidate source.")
     return retained, final, states
 
 
@@ -1409,8 +1448,10 @@ def build_qa(
         state = states[spec.key]
         if spec.kind == "categorical":
             add_qa(rows, "ENCODING VALIDATION", f"{spec.key}: source non-missing rows", state["source_nonmissing"], spec.source_fields[0])
+            add_qa(rows, "ENCODING VALIDATION", f"{spec.key}: source missing rows", state["source_missing"], spec.source_fields[0])
             add_qa(rows, "ENCODING VALIDATION", f"{spec.key}: encoded valid rows", state["encoded_valid_rows"], "full-indicator block")
             add_qa(rows, "ENCODING VALIDATION", f"{spec.key}: invalid/unmapped source codes", state["invalid_unmapped"], "must be zero")
+            add_qa(rows, "ENCODING VALIDATION", f"{spec.key}: overlapping categories", state["overlap_rows"], "must be zero")
             add_qa(rows, "ENCODING VALIDATION", f"{spec.key}: category row-sum failures", state["row_sum_failures"], "must be zero")
         elif spec.kind == "binary":
             add_qa(rows, "ENCODING VALIDATION", f"{spec.key}: invalid binary values", state["invalid_unmapped"], spec.source_fields[0])
@@ -1463,6 +1504,13 @@ def build_qa(
     add_qa(rows, "OUTPUT", "final rows", len(final), "single-driver design matrix")
     add_qa(rows, "OUTPUT", "final columns", len(final.columns), "controls plus encoded feature superset")
     add_qa(rows, "OUTPUT", "encoded features", len(feature_columns(TRANSFORMATION_REGISTRY)), "registry-defined feature columns")
+    add_qa(rows, "OUTPUT", "raw purpose candidate columns", len(PURPOSE_PASSTHROUGH_COLUMNS), "unencoded, appended, inactive in existing model specification")
+    add_qa(rows, "OUTPUT", "new purpose indicator columns",
+           len(feature_columns(TRANSFORMATION_REGISTRY[-len(PURPOSE_EXTENSION_KEYS):])),
+           "appended after the unchanged legacy matrix schema")
+    for column in PURPOSE_PASSTHROUGH_COLUMNS:
+        observed = retained[column].astype("string").str.strip().fillna("").ne("").sum()
+        add_qa(rows, "PURPOSE", f"{column} observed", int(observed), f"of {len(retained)} retained occasions")
     add_qa(rows, "OUTPUT", "unique CHOICE_ID", final["CHOICE_ID"].nunique(), "must equal final rows")
     add_qa(rows, "OUTPUT", "rows with any unexpected encoding failure", unexpected, "must be zero")
     add_qa(rows, "OUTPUT", "global complete-case filtering performed", 0, "no optional missingness caused row deletion")
@@ -1569,6 +1617,13 @@ def generate_markdown(
         registry_table(blocks["Vehicle attributes"]),
         "",
         "## 7. Alternative specification blocks",
+        "",
+        "The final CSV preserves all legacy encoded features followed by the three raw purpose context fields, then appends the two new eight-indicator candidate blocks. The raw codes are not continuous regressors.",
+        "",
+        "- `TOUR_MAIN_PURPOSE` is official closing-trip hwzweck2, used as a tour-priority-purpose proxy. Exact equivalence to the priority rule for each independently reconstructed Tour is unverified.",
+        "- `TOUR_LONGEST_DRIVER_TRIP_HWZWECK2` uses the longest valid identifiable household-car driving trip in the personal Tour; ties and unavailable identities follow the upstream QA rules.",
+        "- Official hwzweck2 codes 6=Leisure and 7=Escort in both new blocks. Original first-trip W_ZWECK uses 6=Escort and 7=Leisure.",
+        "- Each new block has seven substantive indicators and a missing indicator; missingness does not impute a purpose. The full block is a candidate feature set and is not selected in Core-V1.",
         "",
         "- Purpose representation: use either the `TOUR_FIRST_PURPOSE` indicator block or the eight `TOUR_HAS_*` indicators as a predefined specification. Do not automatically stack both complete blocks.",
         "- V1 vehicle representation: Powertrain + Segment + Vehicle Age.",
@@ -1677,6 +1732,11 @@ def write_outputs(final: pd.DataFrame, qa: pd.DataFrame, markdown: str) -> None:
         raise AssertionError("Saved design matrix failed shape/schema read-back validation.")
     if not saved["CHOICE_ID"].equals(final["CHOICE_ID"].astype(str)):
         raise AssertionError("Saved design matrix changed CHOICE_ID order during serialization.")
+    for column in PURPOSE_PASSTHROUGH_COLUMNS:
+        if not saved[column].astype("string").fillna("").reset_index(drop=True).equals(
+            final[column].astype("string").fillna("").reset_index(drop=True)
+        ):
+            raise AssertionError(f"Saved purpose passthrough changed {column} or its missingness.")
     saved_qa = read_strings(SINGLE_DRIVER_MNL_DESIGN_MATRIX_QA_PATH)
     if list(saved_qa.columns) != ["section", "metric", "value", "description"]:
         raise AssertionError("Saved QA schema changed during serialization.")

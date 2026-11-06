@@ -393,6 +393,7 @@ def compare_overlap(
     candidate: pd.DataFrame,
     canonical_columns: list[str],
     label: str,
+    allowed_changed_columns: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     if list(reference.columns) != canonical_columns:
         raise AssertionError(f"{label} reference does not use the canonical ordered schema.")
@@ -431,7 +432,8 @@ def compare_overlap(
         column for column in canonical_columns if differences[column].any()
     ]
     examples: list[dict[str, str]] = []
-    if row_mismatch.any():
+    unexpected_columns = [column for column in mismatch_columns if column not in allowed_changed_columns]
+    if unexpected_columns:
         for column in mismatch_columns:
             for choice_id in differences.index[differences[column]][:5]:
                 examples.append(
@@ -447,7 +449,7 @@ def compare_overlap(
         print(f"\n{label.upper()} OVERLAP MISMATCH EXAMPLES")
         print(pd.DataFrame(examples[:10]).to_string(index=False))
         raise AssertionError(
-            f"{label} overlap contains canonical-feature differences; "
+            f"{label} overlap contains unauthorized canonical-feature differences {unexpected_columns}; "
             f"rtol={COMPARISON_RTOL}, atol={COMPARISON_ATOL}."
         )
     return {
@@ -799,6 +801,7 @@ def main() -> None:
         serialized_final[canonical_columns],
         canonical_columns,
         "sensitivity",
+        frozenset({"HOUSEHOLD_ACCOMPANIED"}),
     )
     final_metrics = validate_final(
         final,

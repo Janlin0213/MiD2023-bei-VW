@@ -1,8 +1,9 @@
-"""Four pre-estimation diagnostics for the fixed 24-column Core–V1 design."""
+"""Pre-estimation diagnostics for the controlled 26-column Core–V1 design."""
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -14,6 +15,8 @@ for ancestor in Path(__file__).resolve().parents:
     if (ancestor / ".git").exists():
         sys.path.insert(0, str(ancestor))
         break
+
+from src.thesis_pipeline.paths import MODEL_INPUT_DIR, MODEL_INPUT_SENSITIVITY_DIR  # noqa: E402
 
 PREPARE_PATH = Path(__file__).with_name("01_prepare_core_v1.py")
 spec = importlib.util.spec_from_file_location("core_v1_prepare", PREPARE_PATH)
@@ -27,6 +30,40 @@ DIAG = ROOT / "diagnostics"
 REVIEW = ROOT / "review"
 
 
+def accompaniment_transition() -> pd.DataFrame:
+    """Compare independently constructed focal-departure and tour-driving flags."""
+    columns = ["CHOICE_ID", "HOUSEHOLD_ACCOMPANIED", "W_GEW"]
+    strict = pd.read_csv(MODEL_INPUT_DIR / "mnl_vehicle_choice_model_input.csv",
+                         usecols=columns, dtype={"CHOICE_ID": "string"})
+    sensitivity = pd.read_csv(
+        MODEL_INPUT_SENSITIVITY_DIR / "mnl_vehicle_choice_model_input_decision_timing_sensitivity.csv",
+        usecols=columns, dtype={"CHOICE_ID": "string"})
+    for label, frame in (("strict", strict), ("sensitivity", sensitivity)):
+        if frame.CHOICE_ID.isna().any() or not frame.CHOICE_ID.is_unique:
+            raise AssertionError(f"{label} accompaniment identifiers are missing or duplicated")
+        values = pd.to_numeric(frame.HOUSEHOLD_ACCOMPANIED, errors="coerce")
+        if (frame.HOUSEHOLD_ACCOMPANIED.notna() & values.isna()).any() or not values.dropna().isin([0, 1]).all():
+            raise AssertionError(f"{label} accompaniment flag is not binary or missing")
+        weights = pd.to_numeric(frame.W_GEW, errors="coerce")
+        if not np.isfinite(weights).all() or weights.le(0).any():
+            raise AssertionError(f"{label} accompaniment weights are invalid")
+    joined = strict.merge(sensitivity, on="CHOICE_ID", how="left", validate="one_to_one",
+                          indicator=True, suffixes=("_new", "_old"), sort=False)
+    if len(joined) != len(strict) or joined._merge.ne("both").any():
+        raise AssertionError("Strict occasions are not fully covered by sensitivity occasions")
+    if not np.array_equal(joined.W_GEW_new.to_numpy(float), joined.W_GEW_old.to_numpy(float)):
+        raise AssertionError("Accompaniment comparison weights differ across branches")
+    labels = {0: "No", 1: "Yes"}
+    joined["old_focal_departure"] = joined.HOUSEHOLD_ACCOMPANIED_old.map(labels).fillna("Missing")
+    joined["new_tour_driving"] = joined.HOUSEHOLD_ACCOMPANIED_new.map(labels).fillna("Missing")
+    transition = joined.groupby(["old_focal_departure", "new_tour_driving"],
+                                as_index=False, sort=True).agg(
+        occasions=("CHOICE_ID", "size"), weighted_count=("W_GEW_new", "sum"))
+    if transition.occasions.sum() != len(strict):
+        raise AssertionError("Accompaniment transitions do not reconcile to strict occasions")
+    return transition
+
+
 def numerical_rank(matrix: np.ndarray, relative_tolerance: float | None = None) -> tuple[int, np.ndarray, float]:
     values = np.linalg.svd(matrix, full_matrices=False, compute_uv=False)
     tolerance = (max(matrix.shape) * np.finfo(float).eps * values[0] if relative_tolerance is None
@@ -38,14 +75,16 @@ def composition(sample: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
     rows, crosstabs, continuous = [], [], []
     definitions = {
         "TOUR_N_NONHOME_STOPS": ("tour", "allocation_candidate_model_input", "0,1,2,...", "none"),
-        "HOUSEHOLD_ACCOMPANIED": ("focal departure", "allocation_candidate_model_input", "0=no, 1=yes", "0"),
+        "HOUSEHOLD_ACCOMPANIED": ("verified driving trips within tour", "allocation_candidate_model_input", "0=confirmed no, 1=confirmed yes", "0"),
         "HP_SEX": ("person", "allocation_candidate_model_input", "1=male, 2=female, 3=diverse", "1"),
-        "alter_gr5": ("person", "allocation_candidate_model_input", "3=under18; 4–12=18–64; 13–15=65+", "3–12"),
+        "alter_gr5": ("person", "allocation_candidate_model_input", "3=under18; 4–5=18–29; 6–9=30–49; 10–15=50+", "6–9"),
         "household_type": ("household", "allocation_candidate_model_input", "family/young/adult/senior", "non-family"),
         "RegioStaR4": ("household", "allocation_candidate_model_input", "11/12 urban; 21/22 rural", "21/22"),
         "MULTISTOP": ("tour", "Stage-1 derivation", "0=0–1, 1=2+", "0"),
         "FEMALE": ("person", "Stage-1 derivation", "0=male, 1=female", "0"),
-        "OLDER65": ("person", "Stage-1 derivation", "0=under65, 1=65+", "0"),
+        "AGE_UNDER30": ("person", "Script-05 encoding", "0=other valid age, 1=18–29", "AGE_30_49"),
+        "AGE_30_49": ("person", "Script-05 encoding", "0=other valid age, 1=30–49", "reference"),
+        "AGE_50PLUS": ("person", "Script-05 encoding", "0=other valid age, 1=50+", "AGE_30_49"),
         "FAMILY": ("household", "Stage-1 derivation", "0=non-family, 1=family", "0"),
         "URBAN_REGION": ("household", "Stage-1 derivation", "0=rural, 1=urban", "0"),
     }
@@ -70,7 +109,7 @@ def composition(sample: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
                            "p5": stats["5%"], "p25": stats["25%"], "p75": stats["75%"],
                            "p95": stats["95%"], "p99": stats["99%"],
                            "centering_mean_minutes": float(sample.TOUR_TRAVEL_TIME_MIN.mean())})
-    pairs = [("OLDER65", "FAMILY"), ("OLDER65", "URBAN_REGION"),
+    pairs = [("AGE_UNDER30", "FAMILY"), ("AGE_50PLUS", "URBAN_REGION"),
              ("FAMILY", "URBAN_REGION"), ("MULTISTOP", "HOUSEHOLD_ACCOMPANIED")]
     for left, right in pairs:
         for (a, b), group in sample.groupby([left, right], dropna=False):
@@ -91,7 +130,7 @@ def composition(sample: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
 def alternative_support(sample: pd.DataFrame) -> pd.DataFrame:
     rows = []
     both = sample.AV_1.eq(1) & sample.AV_2.eq(1)
-    contexts = ["MULTISTOP", "HOUSEHOLD_ACCOMPANIED", "FEMALE", "OLDER65", "FAMILY", "URBAN_REGION"]
+    contexts = ["MULTISTOP", "HOUSEHOLD_ACCOMPANIED", "FEMALE", "AGE_UNDER30", "AGE_50PLUS", "FAMILY", "URBAN_REGION"]
     for context in contexts:
         for level in (0, 1):
             mask = sample[context].eq(level) & both
@@ -230,7 +269,7 @@ def vehicle_age_choice_support(sample: pd.DataFrame) -> pd.DataFrame:
     chosen_delta = delta.where(sample.CHOICE.eq(1), -delta)
     both = sample.AV_1.eq(1) & sample.AV_2.eq(1)
     rows = []
-    for context in [None, "FEMALE", "OLDER65", "FAMILY", "URBAN_REGION"]:
+    for context in [None, "FEMALE", "AGE_UNDER30", "AGE_50PLUS", "FAMILY", "URBAN_REGION"]:
         active = pd.Series(True, index=sample.index) if context is None else sample[context].eq(1)
         contrast = active & delta.ne(0)
         informative = contrast & both
@@ -257,6 +296,35 @@ def vehicle_age_choice_support(sample: pd.DataFrame) -> pd.DataFrame:
                      "chosen_minus_nonchosen_p95": quantiles.loc[.95],
                      "chosen_minus_nonchosen_min": values.min(),
                      "chosen_minus_nonchosen_max": values.max()})
+    return pd.DataFrame(rows)
+
+
+def age_group_support(sample: pd.DataFrame, design: pd.DataFrame) -> pd.DataFrame:
+    """Report group size separately from identifying BEV and age contrasts."""
+    rows = []
+    bev = design["D_PT_BEV"]
+    age = design["D_VEHICLE_AGE"]
+    for column, label in [("AGE_UNDER30", "Age 18–29"), ("AGE_30_49", "Age 30–49"),
+                          ("AGE_50PLUS", "Age 50+")]:
+        subset = sample[column].eq(1)
+        bev_mask = subset & bev.ne(0)
+        age_mask = subset & age.ne(0)
+        chosen_bev, chosen_nonbev = target_choice_masks(sample, bev, bev_mask)
+        chosen_age = age.where(sample.CHOICE.eq(1), -age)
+        w = sample.loc[bev_mask, "W_GEW"].to_numpy(float)
+        rows.append({
+            "age_group": label, "indicator": column, "occasions": int(subset.sum()),
+            "households": sample.loc[subset, "H_ID"].nunique(),
+            "weighted_descriptive_share": sample.loc[subset, "W_GEW"].sum() / sample.W_GEW.sum(),
+            "informative_BEV_contrasts": int(bev_mask.sum()),
+            "chosen_BEV": int(chosen_bev.sum()), "chosen_non_BEV": int(chosen_nonbev.sum()),
+            "nonzero_vehicle_age_differences": int(age_mask.sum()),
+            "chosen_older": int((age_mask & chosen_age.gt(0)).sum()),
+            "chosen_younger": int((age_mask & chosen_age.lt(0)).sum()),
+            "BEV_support_weight_sum": float(w.sum()),
+            "BEV_support_Kish_n_eff_descriptive": float(w.sum()**2 / np.square(w).sum()) if len(w) else np.nan,
+            "BEV_support_max_individual_weight_share": float(w.max()/w.sum()) if len(w) else np.nan,
+        })
     return pd.DataFrame(rows)
 
 
@@ -381,7 +449,7 @@ def matrix_diagnostics(design: pd.DataFrame) -> tuple[dict, pd.DataFrame, pd.Dat
             status = ("undefined/infinite; auxiliary exact dependency" if not np.isfinite(vif) else
                       "VIF >= 10" if vif >= 10 else "VIF >= 5" if vif >= 5 else "below descriptive references")
         vif_rows.append({"predictor": name, "VIF": vif, "auxiliary_R2": r2, "status": status,
-                         "procedure": "OLS on intercept and other 23 effective predictors; centered TSS"})
+                         "procedure": f"OLS on intercept and other {p-1} effective predictors; centered TSS"})
     metrics = {"n": n, "p": p, "rank": rank, "scaled_rank": scaled_rank, "rank_tolerance": tol,
                "raw_condition": raw_condition, "scaled_condition": scaled_condition,
                "qr_dependent_terms": dependent, "qr_independent_terms": independent,
@@ -394,16 +462,27 @@ def diagnose() -> dict:
     REVIEW.mkdir(parents=True, exist_ok=True)
     baseline_path = REVIEW / "core_v1_targeted_QA_baseline.json"
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    migration = os.environ.get("CORE_V1_APPROVED_MIGRATION") == "1"
+    if migration:
+        rollback = prep.REPO_ROOT / "data_processed" / ".core_v1_rollback_2026-10-15"
+        saved = json.loads((rollback / "backup_manifest.json").read_text(encoding="utf-8"))
+        for relative, record in saved.items():
+            if prep.sha256(rollback / relative) != record["sha256"]:
+                raise AssertionError(f"Verified rollback copy changed: {relative}")
     for category in ("protected_stage1", "baseline_diagnostics", "upstream_and_stage0"):
         for filename, digest in baseline[category].items():
-            if prep.sha256(Path(filename)) != digest:
+            if migration and (category != "upstream_and_stage0" or Path(filename).name in {
+                    "single_driver_mnl_design_matrix.csv", "allocation_candidate_model_input.csv",
+                    "05_build_single_driver_mnl_design_matrix.py", "vehicle_choice.py", "tour_features.py"}):
+                continue
+            if prep.sha256(prep.protected_path(filename)) != digest:
                 raise AssertionError(f"Targeted-QA baseline changed before diagnostics: {filename}")
     metadata = json.loads((DATA / "core_v1_transformations.json").read_text(encoding="utf-8"))
     for filename, digest in metadata["source_hashes_sha256"].items():
-        if prep.sha256(Path(filename)) != digest:
+        if prep.sha256(prep.protected_path(filename)) != digest:
             raise AssertionError(f"Accepted source changed since preparation: {filename}")
     for filename, digest in metadata["accepted_stage0_result_hashes_sha256"].items():
-        if prep.sha256(Path(filename)) != digest:
+        if prep.sha256(prep.protected_path(filename)) != digest:
             raise AssertionError(f"Accepted Stage-0 result changed since preparation: {filename}")
     sample = pd.read_csv(DATA / "core_v1_context_sample.csv", dtype={k: "string" for k in prep.JOIN_KEYS}, low_memory=False)
     design_csv = pd.read_csv(DATA / "core_v1_effective_design.csv", dtype={"CHOICE_ID": "string", "H_ID": "string"})
@@ -428,10 +507,32 @@ def diagnose() -> dict:
     continuous.to_csv(DIAG / "core_v1_time_distribution.csv", index=False)
     alternative_support(sample).to_csv(DIAG / "core_v1_alternative_support.csv", index=False)
     support, time_support = interaction_support(sample, design)
+    if support.informative_contrasts_n.eq(0).any():
+        raise AssertionError("A required interaction has no informative vehicle contrast.")
     support.to_csv(DIAG / "core_v1_interaction_support.csv", index=False)
     time_support.to_csv(DIAG / "core_v1_time_interaction_support.csv", index=False)
     age_choice = vehicle_age_choice_support(sample)
     age_choice.to_csv(DIAG / "core_v1_vehicle_age_choice_support.csv", index=False)
+    age_groups = age_group_support(sample, design)
+    if age_groups.occasions.sum() != len(sample) or age_groups.loc[age_groups.indicator.ne("AGE_30_49"), "informative_BEV_contrasts"].eq(0).any():
+        raise AssertionError("Revised age-group counts or effective BEV support failed.")
+    age_groups.to_csv(DIAG / "core_v1_age_group_support.csv", index=False)
+    transition = accompaniment_transition()
+    transition.to_csv(DIAG / "core_v1_household_accompaniment_transition.csv", index=False)
+    old_sample_path = prep.REPO_ROOT / "data_processed" / ".core_v1_rollback_2026-10-15" / "outputs" / "mnl" / "stage1" / "core_v1" / "data" / "core_v1_context_sample.csv"
+    if old_sample_path.is_file():
+        old_ids = set(pd.read_csv(old_sample_path, usecols=["CHOICE_ID"], dtype="string").CHOICE_ID)
+        new_ids = set(sample.CHOICE_ID)
+        n_stage0 = int(metadata["sample"]["stage0_valid_n"])
+        retention = pd.DataFrame([
+            {"old_retained": 1, "new_retained": 1, "occasions": len(old_ids & new_ids)},
+            {"old_retained": 1, "new_retained": 0, "occasions": len(old_ids - new_ids)},
+            {"old_retained": 0, "new_retained": 1, "occasions": len(new_ids - old_ids)},
+            {"old_retained": 0, "new_retained": 0, "occasions": n_stage0 - len(old_ids | new_ids)},
+        ])
+        if retention.occasions.sum() != n_stage0:
+            raise AssertionError("Old/new Stage-1 retention does not reconcile to Stage-0.")
+        retention.to_csv(DIAG / "core_v1_stage1_retention_transition.csv", index=False)
     weighted_support = weighted_interaction_support(sample, design)
     if not np.array_equal(weighted_support.informative_occasions_n.to_numpy(), support.informative_contrasts_n.to_numpy()):
         raise AssertionError("Weighted-support subset differs from interaction support")
@@ -440,6 +541,8 @@ def diagnose() -> dict:
     age_summary.to_csv(DIAG / "core_v1_vehicle_age_extreme_summary.csv", index=False)
     age_cases.to_csv(DIAG / "core_v1_vehicle_age_extreme_contrasts.csv", index=False)
     metrics, rank, singular, condition, vif, corr = matrix_diagnostics(design.loc[both])
+    if metrics["p"] != 26 or metrics["rank"] != 26:
+        raise AssertionError(f"Revised effective design rank is {metrics['rank']}/{metrics['p']}.")
     rank.to_csv(DIAG / "core_v1_rank_diagnostics.csv", index=False)
     singular.to_csv(DIAG / "core_v1_singular_values.csv", index=False)
     condition.to_csv(DIAG / "core_v1_condition_diagnostics.csv", index=False)
@@ -481,13 +584,18 @@ def diagnose() -> dict:
               f"- Source: {flow_counts['initial_single_active_driver_occasions']:,}; Stage-0 valid: {flow_counts['stage0_valid_v1_occasions']:,}; Stage-1 exclusions: {flow_counts['stage1_unique_exclusions']:,}; candidate: {len(sample):,}; households: {sample.H_ID.nunique():,}.",
               f"- Missing required context: {flow_counts['stage1_missing_required_context']:,}; invalid category with no missing context: {flow_counts['stage1_invalid_nonmissing_context']:,}; overlapping context reasons: {flow_counts['stage1_exclusion_reason_overlap']:,}.",
               f"- Both available: {both.sum():,}; single available: {(~both).sum():,}. Primary identification diagnostics use both available.",
-              f"- Under-18 drivers retained and flagged: {flow_counts['stage1_under18_drivers']:,}.", "",
+              f"- Under-18 drivers excluded at Stage-1 only: {flow_counts['stage0_under18_drivers_excluded_at_stage1']:,}.", "",
               f"- Diverse sex code 3 in Stage-0 valid sample: {flow_counts['stage0_diverse_sex_code_3']:,}; other missing/invalid sex: {flow_counts['stage0_missing_or_other_invalid_sex']:,}. Both are excluded from the male/female interaction. Original category counts and retained counts are in `core_v1_pre_exclusion_context_codes.csv`.", "",
-              "## C. Fixed candidate specification", "", "Seven vehicle main effects and 17 interactions; no intercept or generic context main effects. Reference categories: ICE, SMALL, male, under 65, non-family, rural region, no household companion, and 0–1 stops. HEV and ICE travel-time slopes are constrained to zero.", "",
+              "## C. Fixed candidate specification", "", "Seven vehicle main effects and 19 interactions; no intercept or generic context main effects. Reference categories: ICE, SMALL, male, age 30–49, non-family, rural region, confirmed no household companion during driving, and 0–1 stops. HEV and ICE travel-time slopes are constrained to zero.", "",
               "| Predictor | Effective formula |", "|---|---|",
               *[f"| {item['predictor']} | `{item['formula']}` |" for item in metadata['main_effects'] + metadata['interactions']], "",
               "## D. Composition", "",
               f"- Travel time mean for centering: {metadata['centering_mean_minutes']:.6f} minutes. Full category shares, weighted descriptive shares, time quantiles, and cross-tabs are in diagnostics CSVs.", "",
+              "- Age groups, household counts, weighted shares, effective BEV and vehicle-age contrasts, choice direction, and weight concentration are in `core_v1_age_group_support.csv`.",
+              "- Focal-departure versus verified tour-driving accompaniment, including raw and weighted Yes/No/Missing transitions, is in `core_v1_household_accompaniment_transition.csv`.",
+              ("- Optional old/new Stage-1 retention is in `core_v1_stage1_retention_transition.csv`; "
+               "current context exclusions and overlaps are in `core_v1_sample_flow.csv`." if old_sample_path.is_file()
+               else "- No historical rollback sample was supplied. Current context exclusions and overlaps are in `core_v1_sample_flow.csv`."), "",
               "## E. Effective interaction support", "",
               "Support counts are unweighted identifying occasions. Weighted shares describe the sample only. For time interactions, contrast counts use vehicle differences even at centered time near zero. Detailed choice direction, age contrasts, and time bins are in the support files.", "",
               "| Term | Both-available contrasts | Households | Warning |", "|---|---:|---:|---|",
@@ -502,19 +610,23 @@ def diagnose() -> dict:
               *([f"- {w}" for w in warnings] or ["- No threshold warnings; inspect all detailed outputs manually."]),
               "- Tour travel time and stop count are realized diary-tour characteristics. These associations must not be interpreted causally or assumed known at allocation time.",
               "- The accepted model input has no original vehicle A_ID columns; vehicle labels and H_ID remain traceable. No A_ID was inferred.", "",
-              "## I. Manual decision", "", "**PENDING_MANUAL_REVIEW. No MNL estimation has been run.**", "",
-              "## Targeted QA addendum", "", "See `core_v1_targeted_QA_addendum.md` for choice direction, age direction, time-bin support, weight concentration, and extreme-age inspection. The candidate sample and 24-column effective design are unchanged.", ""]
+              "## I. Manual decision", "", "**PENDING_MANUAL_REVIEW. Stage-5 estimation is authorized separately.**", "",
+              "## Targeted QA addendum", "", "See `core_v1_targeted_QA_addendum.md` for choice direction, age direction, time-bin support, weight concentration, and extreme-age inspection. The current candidate sample and 26-column effective design were validated against current upstream inputs.", ""]
     (REVIEW / "core_v1_pre_estimation_QA.md").write_text("\n".join(report), encoding="utf-8")
     checklist = ["# Core–V1 manual review checklist", "", "Decision: PENDING_MANUAL_REVIEW", "",
-                 *[f"- [ ] {item}" for item in ["Input paths and joins verified", "No accepted upstream files changed", "Stage-0 V1 sample rules reproduced", "Stage-1 sample losses understood", "Context coding and reference groups correct", "Exactly 24 candidate predictors", "All effective interaction formulas validated", "Availability-aware identifying support checked", "Rank assessed and acceptable or explicitly resolved", "Condition number reviewed", "VIF and correlation reviewed", "Weak-support interactions reviewed", "Final decision documented"]], ""]
+                 *[f"- [ ] {item}" for item in ["Input paths and joins verified", "No accepted upstream files changed", "Stage-0 V1 sample rules reproduced", "Stage-1 sample losses understood", "Context coding and reference groups correct", "Exactly 26 candidate predictors", "All effective interaction formulas validated", "Availability-aware identifying support checked", "Rank assessed and acceptable or explicitly resolved", "Condition number reviewed", "VIF and correlation reviewed", "Weak-support interactions reviewed", "Final decision documented"]], ""]
     (REVIEW / "core_v1_manual_review_checklist.md").write_text("\n".join(checklist), encoding="utf-8")
     for category in ("protected_stage1", "baseline_diagnostics", "upstream_and_stage0"):
         for filename, digest in baseline[category].items():
-            if prep.sha256(Path(filename)) != digest:
+            if migration and (category != "upstream_and_stage0" or Path(filename).name in {
+                    "single_driver_mnl_design_matrix.csv", "allocation_candidate_model_input.csv",
+                    "05_build_single_driver_mnl_design_matrix.py", "vehicle_choice.py", "tour_features.py"}):
+                continue
+            if prep.sha256(prep.protected_path(filename)) != digest:
                 raise AssertionError(f"Targeted-QA protected data or numerical diagnostic changed: {filename}")
     if not (age_choice.chosen_older_n + age_choice.chosen_younger_n).eq(age_choice.both_available_nonzero_n).all():
         raise AssertionError("Chosen older/younger counts do not reconcile")
-    priority = ["D_OLDER_BEV", "D_FAMILY_LARGE", "D_FAMILY_BEV", "D_URBAN_BEV", "D_TIME_PHEV", "D_TIME_BEV"]
+    priority = ["D_AGE_UNDER30_BEV", "D_AGE_50PLUS_BEV", "D_FAMILY_LARGE", "D_FAMILY_BEV", "D_URBAN_BEV", "D_TIME_PHEV", "D_TIME_BEV"]
     weighted_priority = weighted_support.set_index("predictor").loc[priority].reset_index()
     binary_support = support.loc[support.target.ne("D_VEHICLE_AGE")]
     target_flags = binary_support.loc[binary_support.warning.str.contains("target always chosen|target never chosen|weak target-choice direction", regex=True)]
@@ -523,14 +635,15 @@ def diagnose() -> dict:
     age_case_class = age_cases.review_classification.value_counts().to_dict()
     protected_hash_lines = []
     for filename, digest in baseline["protected_stage1"].items():
-        protected_hash_lines.append(f"| `{Path(filename).name}` | `{digest}` | `{prep.sha256(Path(filename))}` |")
+        protected_hash_lines.append(f"| `{Path(filename).name}` | `{digest}` | `{prep.sha256(prep.protected_path(filename))}` |")
     addendum = [
         "# Core–V1 targeted pre-estimation QA addendum", "", "**Decision: PENDING_MANUAL_REVIEW**", "",
         "## 1. Scope and integrity", "",
-        "Modified: `scripts/05_mnl/stage1/02_diagnose_core_v1.py` and `scripts/05_mnl/stage1/test_core_v1.py`. The preparation script, accepted Stage-0 scripts/results, upstream inputs, Stage-1 sample, context coding, and all 24 predictor formulas were left unchanged.", "",
+        "The current accompaniment and encoded driver ages are validated against the prepared sample and protected source inputs.", "",
         "| Protected Stage-1 file | SHA-256 before | SHA-256 after |", "|---|---|---|", *protected_hash_lines, "",
-        f"All {len(baseline['upstream_and_stage0'])} protected upstream/Stage-0 hashes and four baseline rank/condition/VIF/correlation file hashes match the baseline snapshot (`core_v1_targeted_QA_baseline.json`).", "",
-        f"N={len(sample):,}; households={sample.H_ID.nunique():,}; predictors={len(prep.PREDICTORS)} in unchanged order. Rank={metrics['rank']}/{metrics['p']}; raw condition={metrics['raw_condition']:.4f}; scaled condition={metrics['scaled_condition']:.4f}; max VIF={metrics['max_vif']:.4f}. Choice, availability, survey weights, and all saved design values match the protected inputs.", "",
+        ("The explicitly requested migration was validated against the local rollback snapshot." if migration
+         else "Normal diagnostics validate current inputs and prepared outputs without a rollback snapshot."), "",
+        f"N={len(sample):,}; households={sample.H_ID.nunique():,}; predictors={len(prep.PREDICTORS)} in approved revised order. Rank={metrics['rank']}/{metrics['p']}; raw condition={metrics['raw_condition']:.4f}; scaled condition={metrics['scaled_condition']:.4f}; max VIF={metrics['max_vif']:.4f}. Choice, availability, survey weights, and all saved design values match the protected inputs.", "",
         "## 2. Corrected binary target-choice support", "",
         "The chosen target is determined from `CHOICE` and the sign of the target vehicle-attribute contrast. `chosen_car1_both`/`chosen_car2_both` remain label-balance fields and do not drive the target-choice warning. The descriptive weak-direction reference is fewer than 10 outcomes in either chosen-target direction; it is not evidence of statistical separation.", "",
         "| Interaction | Contrasts | Chosen target | Chosen non-target | Target share | Target-choice flag |", "|---|---:|---:|---:|---:|---|",
@@ -549,15 +662,15 @@ def diagnose() -> dict:
         "Kish `n_eff=(Σw)²/Σw²` is an occasion-level descriptive measure. It is not a count of independent households or a formal complex-survey effective sample size. Household contributions sum supporting occasion weights by `H_ID`; no household-level effective sample size is inferred. Concentration flags use individual share >10%, top-five household share >25%, or Kish ratio <50%, solely as review references.", "",
         "| Priority interaction | Contrasts | Households | Kish n_eff | Kish/N | Max individual share | Top-five household share |", "|---|---:|---:|---:|---:|---:|---:|",
         *[f"| {r.predictor} | {r.informative_occasions_n:,} | {r.supporting_households_n:,} | {r.kish_n_eff_descriptive:.1f} | {r.kish_n_eff_per_occasion:.3f} | {r.max_individual_weight_share:.3f} | {r.top5_households_weight_share:.3f} |" for _, r in weighted_priority.iterrows()], "",
-        f"Concentration flags across 17 interactions: {len(concentration_flags)}, all from Kish/N <0.5. The largest single-occasion weight share is {weighted_support.max_individual_weight_share.max():.3f}; the largest top-five-household share is {weighted_support.top5_households_weight_share.max():.3f}. Thus no subset crosses the separate 10% individual or 25% top-five-household references. All 17 weight distributions are in `core_v1_weighted_interaction_support.csv`.", "",
+        f"Concentration flags across {len(prep.INTERACTIONS)} interactions: {len(concentration_flags)}. Kish/N <0.5 occurs in {int(weighted_support.kish_n_eff_per_occasion.lt(.5).sum())} subsets, individual weight share >10% in {int(weighted_support.max_individual_weight_share.gt(.1).sum())}, and top-five-household share >25% in {int(weighted_support.top5_households_weight_share.gt(.25).sum())}. Largest individual share is {weighted_support.max_individual_weight_share.max():.3f}; largest top-five-household share is {weighted_support.top5_households_weight_share.max():.3f}. All distributions are in `core_v1_weighted_interaction_support.csv`.", "",
         "## 6. Extreme vehicle-age contrasts", "",
         f"Absolute age difference: minimum {age_summary.iloc[0].min_abs_delta_age:.1f}, median {age_summary.iloc[0].median_abs_delta_age:.1f}, P90 {age_summary.iloc[0].p90_abs_delta_age:.1f}, P95 {age_summary.iloc[0].p95_abs_delta_age:.1f}, P99 {age_summary.iloc[0].p99_abs_delta_age:.1f}, P99.5 {age_summary.iloc[0].p995_abs_delta_age:.1f}, maximum {age_summary.iloc[0].max_abs_delta_age:.1f} years. Zero differences: {int(age_summary.iloc[0].zero_difference_n):,}; >30: {int(age_summary.iloc[0].abs_difference_gt30_n):,}; >40: {int(age_summary.iloc[0].abs_difference_gt40_n):,}.", "",
         f"The local top-20 table classifies {age_case_class.get('requires upstream verification', 0)} cases as requiring upstream verification (>40-year difference) and {age_case_class.get('potentially unusual but not demonstrably invalid', 0)} as unusual but not demonstrably invalid. These are review priorities, not data corrections. Original construction-year data were unavailable in the verified Stage-1 source; no unverified vehicle join was made. No age values were changed or excluded.", "",
         "## 7. Final pre-estimation recommendation", "",
-        "- **PASS:** protected inputs and design unchanged; target-choice, age-choice, time-bin, and weight calculations reconcile; numerical rank, condition, VIF, and correlation remain unchanged.",
+        "- **PASS:** protected Stage-0 inputs and design invariants verified; target-choice, age-choice, time-bin, and weight calculations reconcile; numerical rank, condition, VIF, and correlation recomputed.",
         f"- **REVIEW:** {len(target_flags)} target-choice flags, {len(time_flags)} sparse time bins, {len(concentration_flags)} weight-concentration flags, and the {age_case_class.get('requires upstream verification', 0)} top age-contrast cases marked for upstream verification. Existing VIF/correlation warnings remain descriptive.",
         "- **BLOCKER:** none found in the targeted computations. Unusual age contrasts need human review before treating them as substantively credible.", "",
-        "The candidate appears computationally ready for Stage-5 estimation, **subject to human approval**. Official decision remains **PENDING_MANUAL_REVIEW**. No MNL estimation was performed.", "",
+        "The revised candidate is submitted to the authorized Stage-5 estimation, subject to the stop conditions. Official decision remains **PENDING_MANUAL_REVIEW**. Stage-5 estimation runs separately.", "",
     ]
     (REVIEW / "core_v1_targeted_QA_addendum.md").write_text("\n".join(addendum), encoding="utf-8")
     manifest = {"decision_status": "PENDING_MANUAL_REVIEW", "source_hashes_sha256": metadata["source_hashes_sha256"],
@@ -566,20 +679,20 @@ def diagnose() -> dict:
                 "stage0_valid_n": metadata["sample"]["stage0_valid_n"], "stage1_candidate_n": len(sample),
                 "both_available_n": int(both.sum()), "warning_count": len(warnings),
                 "warning_criteria": ["informative contrasts <30", "one-sided contrast/choice", "scaled condition >=1e8", "VIF >=5 and >=10 descriptive references", "absolute Pearson correlation >=0.8"],
-                "stage1_code_files": [str(PREPARE_PATH.resolve()), str(Path(__file__).resolve()),
-                                      str(Path(__file__).with_name("test_core_v1.py").resolve())],
-                "stage1_output_files": sorted({str(p.resolve()) for p in ROOT.rglob("*") if p.is_file()} |
-                                              {str((REVIEW / "core_v1_input_manifest.json").resolve())})}
+                "stage1_code_files": [prep.repo_relative(PREPARE_PATH), prep.repo_relative(Path(__file__)),
+                                      prep.repo_relative(Path(__file__).with_name("test_core_v1.py"))],
+                "stage1_output_files": sorted({prep.repo_relative(p) for p in ROOT.rglob("*") if p.is_file() and "estimation" not in p.parts} |
+                                              {prep.repo_relative(REVIEW / "core_v1_input_manifest.json")})}
     (REVIEW / "core_v1_input_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     (REVIEW / "core_v1_warnings.json").write_text(json.dumps(warnings, indent=2), encoding="utf-8")
     for filename, digest in metadata["source_hashes_sha256"].items():
-        if prep.sha256(Path(filename)) != digest:
+        if prep.sha256(prep.protected_path(filename)) != digest:
             raise AssertionError(f"Accepted source changed during diagnostics: {filename}")
     for filename, digest in metadata["accepted_stage0_result_hashes_sha256"].items():
-        if prep.sha256(Path(filename)) != digest:
+        if prep.sha256(prep.protected_path(filename)) != digest:
             raise AssertionError(f"Accepted Stage-0 result changed during diagnostics: {filename}")
     print("Inputs:", *metadata["source_lineage"].values(), sep="\n  ")
-    print(f"Stage-0 valid N={metadata['sample']['stage0_valid_n']:,}; Stage-1 N={len(sample):,}; households={sample.H_ID.nunique():,}; main=7; interactions=17")
+    print(f"Stage-0 valid N={metadata['sample']['stage0_valid_n']:,}; Stage-1 N={len(sample):,}; households={sample.H_ID.nunique():,}; main=7; interactions={len(prep.INTERACTIONS)}")
     print(f"Both-available informative occasions={both.sum():,}; rank={metrics['rank']}/{metrics['p']}; raw condition={metrics['raw_condition']:.6g}; scaled condition={metrics['scaled_condition']:.6g}; max VIF={metrics['max_vif']:.6g}; warnings={len(warnings)}")
     print(f"Output: {ROOT.resolve()}; decision=PENDING_MANUAL_REVIEW; estimation=NOT_PERFORMED")
     return {"metrics": metrics, "warnings": warnings, "manifest": manifest}

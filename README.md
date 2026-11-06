@@ -34,7 +34,9 @@ The public, version-controlled project is organized as follows:
 │   ├── 01_descriptive/
 │   ├── 02_choice_reconstruction/
 │   ├── 03_model_input/
-│   └── 04_screening/
+│   ├── 04_screening/
+│   └── 05_mnl/
+├── run-pipeline.ps1        Windows pipeline launcher
 ├── src/                    Reusable Python implementation
 │   └── thesis_pipeline/
 ├── .gitignore
@@ -96,8 +98,9 @@ scripts write generated results to `outputs/`.
 
 ## Analytical workflow
 
-Descriptive analysis and choice reconstruction branch from prepared data. The
-descriptive branch is not a prerequisite for reconstructing choice occasions.
+Descriptive analysis and choice reconstruction branch from prepared data.
+Association screening is a diagnostic branch from model inputs; it is not a
+prerequisite for MNL estimation.
 
 ```text
                          ┌── 01_descriptive
@@ -108,12 +111,8 @@ descriptive branch is not a prerequisite for reconstructing choice occasions.
                                       │
                                       ▼
                                 03_model_input
-                                      │
-                                      ▼
-                                 04_screening
-                                      │
-                                      ▼
-                            05_mnl (under development)
+                                  ├── 04_screening
+                                  └── 05_mnl (Stage-0, Core-V1, Core-V2)
 ```
 
 ### 00 — Data preparation
@@ -131,6 +130,7 @@ descriptive branch is not a prerequisite for reconstructing choice occasions.
 | `scripts/01_descriptive/03_habitual_car_use_orientation.py` | Examines weighted habitual car-use orientation by car ownership, spatial context, and household type. |
 | `scripts/01_descriptive/04_reference_day_mobility_intensity.py` | Compares weighted reference-day trip, distance, and car-driver mobility intensity. |
 | `scripts/01_descriptive/05_driver_vehicle_bipartite_patterns.py` | Constructs and summarizes observed driver–vehicle usage links, degrees, and household mapping patterns. |
+| `scripts/01_descriptive/06_allocation_sample_support.py` | Reports allocation-candidate support and joint-choice complexity after reconstruction. |
 
 ### 02 — Choice-occasion reconstruction
 
@@ -141,6 +141,7 @@ descriptive branch is not a prerequisite for reconstructing choice occasions.
 | `scripts/02_choice_reconstruction/02_phase2_vehicle_states.py` | Reconstructs household vehicle HOME/AWAY states and candidate vehicle-choice occasions. |
 | `scripts/02_choice_reconstruction/03_phase3_strict_baseline.py` | Applies the strict baseline sample rules and writes classified and wide-format choice occasions. |
 | `scripts/02_choice_reconstruction/04_decision_timing_sensitivity.py` | Builds the broader decision-timing sensitivity sample without overwriting the strict baseline. |
+| `scripts/02_choice_reconstruction/05_allocation_analysis_candidate.py` | Builds the allocation-candidate occasion and household universe. |
 
 ### 03 — Model-input construction
 
@@ -150,7 +151,9 @@ descriptive branch is not a prerequisite for reconstructing choice occasions.
 | `scripts/03_model_input/01b_build_sensitivity_tour_features.py` | Attaches the accepted tour features to the decision-timing sensitivity sample. |
 | `scripts/03_model_input/02_build_mnl_vehicle_choice_model_input.py` | Runs the accepted construction of the baseline wide MNL model-input table. |
 | `scripts/03_model_input/02b_build_sensitivity_model_input.py` | Builds the sensitivity model input using the fixed baseline feature schema. |
-| `scripts/03_model_input/03_decision_timing_sample_comparison.py` | Produces a read-only descriptive comparison of baseline and sensitivity samples. |
+| `scripts/03_model_input/04_build_allocation_candidate_model_input.py` | Joins the allocation candidate to model attributes and tour features. |
+| `scripts/03_model_input/05_build_single_driver_mnl_design_matrix.py` | Encodes the shared model-ready input for Stage-0 and both core models. |
+| `scripts/03_model_input/06_build_purpose_comparison_qa.py` | Compares purpose definitions across the rebuilt analysis populations after Core-V1 preparation. |
 
 ### 04 — Association screening
 
@@ -161,9 +164,12 @@ descriptive branch is not a prerequisite for reconstructing choice occasions.
 
 ### 05 — MNL estimation
 
-The MNL estimation stage is under development. The `scripts/05_mnl/` directory
-is currently empty and has no active estimation entry point. This README does
-not imply a model specification or estimator that has not yet been implemented.
+`scripts/05_mnl/01_estimate_v2_only_mnl.py` and
+`scripts/05_mnl/02_estimate_v1_only_mnl.py` run the Stage-0 models. Core-V1
+and Core-V2 each have preparation, diagnostics, and estimation entry points in
+`scripts/05_mnl/stage1/`. Core-V1 also uses
+`00_build_core_v1_baselines.py` to seal its current-run input and diagnostic
+checks. These entry points run in the order specified by `run-pipeline.ps1`.
 
 ## Scripts and reusable implementation
 
@@ -204,7 +210,7 @@ The environment is ignored by Git and is not stored in the repository.
 1. Clone the repository.
 2. Run `uv sync`.
 3. Supply the authorized raw and reference inputs shown above.
-4. Run the required pipeline stages in dependency order.
+4. Run `./run-pipeline.ps1 -Mode full -Overwrite` in PowerShell.
 5. The pipeline creates `data_processed/` and analytical scripts create
    `outputs/` locally.
 
@@ -242,9 +248,49 @@ workflow entry point from the repository root, use:
 uv run python <path-to-stage-script>
 ```
 
-Run stages in the dependency order shown above and only after their private
-inputs are available. Individual scripts validate their required inputs and
-write to the centralized repository-relative paths.
+### Run the maintained pipeline in PowerShell
+
+From the repository root, use the existing `.venv`:
+
+```powershell
+.\run-pipeline.ps1 -Mode models -Overwrite
+.\run-pipeline.ps1 -Mode full -Overwrite
+.\run-pipeline.ps1 -Mode full -Plan
+```
+
+`models` reuses the current model-ready inputs and runs Stage-0 V2, Stage-0 V1,
+Core-V1, and Core-V2. It is the routine model-development command. `full`
+starts with the four authorized raw MiD2023 tables, rebuilds selected raw data,
+choice occasions, tour and model inputs, descriptive outputs, screening, and
+the same models. Both commands print each stage and stop on failure. The
+`-Plan` lists the selected stages and existing generated outputs without
+running a stage. `-Overwrite` is required when those outputs already exist.
+The launcher holds protected results only while their replacement stage runs;
+it commits each successful stage separately. If a stage fails, it restores
+that stage's protected results and writes `outputs/.pipeline-interrupted.json`.
+Resume the failed stage and remaining suffix with the same mode:
+
+```powershell
+.\run-pipeline.ps1 -Mode full -Overwrite -Resume -Plan
+.\run-pipeline.ps1 -Mode full -Overwrite -Resume
+```
+
+Resume checks the completed stage order, expected output presence and model
+manifest status, and SHA-256 hashes of source code, direct inputs, and
+generated files. It refuses to skip stages if these differ from the failure
+checkpoint. To deliberately recompute from the beginning after an
+interruption, use `-Restart -Overwrite` with the same mode. A hard crash that
+leaves a temporary hold or staging directory requires inspection before
+rerunning. The launcher never removes the original raw MiD files or the
+historical E001 file.
+
+The full run includes the six maintained descriptive scripts, allocation
+candidate support, two screening scripts, and current purpose QA. The
+historical `03_model_input/07_verify_purpose_extension.py` compares old
+snapshots supplied separately and is not part of current production. The
+retired decision-timing comparison and frozen historical Core-V2 baseline are
+not run. Tests are separate from the launcher; Core-V1 estimation runs its
+own required numerical test gate.
 
 ## Data availability
 

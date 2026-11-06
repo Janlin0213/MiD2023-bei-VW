@@ -124,6 +124,16 @@ def numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype("string").str.strip(), errors="coerce")
 
 
+def documented_purpose(series: pd.Series, allowed: set[int], label: str) -> pd.Series:
+    """Retain exact MiD integer codes; never round a fractional purpose into one."""
+    raw = series.astype("string").str.strip()
+    values = numeric(series)
+    invalid = raw.notna() & raw.ne("") & ~values.isin(allowed)
+    if invalid.any():
+        raise ValueError(f"{label} contains {int(invalid.sum())} undocumented or fractional purpose codes.")
+    return values.astype("Int64")
+
+
 def nonblank(series: pd.Series) -> pd.Series:
     return series.astype("string").str.strip().ne("")
 
@@ -138,8 +148,8 @@ def canonicalize_purpose(frame: pd.DataFrame) -> tuple[pd.Series, int]:
     if "W_ZWECK" not in frame.columns and "zweck" not in frame.columns:
         raise KeyError("Phase 1 trip data contains neither W_ZWECK nor accepted fallback zweck.")
 
-    primary = numeric(frame["W_ZWECK"]) if "W_ZWECK" in frame.columns else pd.Series(np.nan, index=frame.index)
-    fallback = numeric(frame["zweck"]) if "zweck" in frame.columns else pd.Series(np.nan, index=frame.index)
+    primary = documented_purpose(frame["W_ZWECK"], set(range(1, 17)) | {99}, "W_ZWECK") if "W_ZWECK" in frame.columns else pd.Series(pd.NA, index=frame.index, dtype="Int64")
+    fallback = documented_purpose(frame["zweck"], set(range(1, 11)) | {99}, "zweck") if "zweck" in frame.columns else pd.Series(pd.NA, index=frame.index, dtype="Int64")
     both = primary.notna() & fallback.notna()
     disagreement = both & primary.ne(fallback)
     pairs = pd.DataFrame({"W_ZWECK": primary[disagreement], "zweck": fallback[disagreement]}).astype(int)
@@ -151,7 +161,7 @@ def canonicalize_purpose(frame: pd.DataFrame) -> tuple[pd.Series, int]:
         raise ValueError("W_ZWECK and zweck disagree outside the documented detailed-purpose refinements.")
 
     canonical = primary.mask(primary.isna(), fallback)
-    return canonical.round().astype("Int64"), int(expected.sum())
+    return canonical.astype("Int64"), int(expected.sum())
 
 
 def canonicalize_trip_attributes(trips: pd.DataFrame) -> tuple[pd.DataFrame, ReconstructionDiagnostics]:
@@ -169,6 +179,8 @@ def canonicalize_trip_attributes(trips: pd.DataFrame) -> tuple[pd.DataFrame, Rec
         "ARRIVAL_MIN",
         DISTANCE_COLUMN,
         TRAVEL_TIME_COLUMN,
+        "pkw_fmf",
+        "W_BEGL_HH",
         *DESTINATION_SPATIAL_SPECS,
     ]
     require_columns(trips, required, "Phase 1")
@@ -196,7 +208,7 @@ def canonicalize_trip_attributes(trips: pd.DataFrame) -> tuple[pd.DataFrame, Rec
     out["_HOME_DESTINATION"] = numeric(out["HOME_DESTINATION"]).where(numeric(out["HOME_DESTINATION"]).isin([0, 1]))
     out["_START_MIN"] = numeric(out["START_MIN"])
     out["_ARRIVAL_MIN"] = numeric(out["ARRIVAL_MIN"])
-    out["_PKW_FMF"] = numeric(out["pkw_fmf"]) if "pkw_fmf" in out.columns else np.nan
+    out["_PKW_FMF"] = numeric(out["pkw_fmf"])
     for source, spec in DESTINATION_SPATIAL_SPECS.items():
         raw_spatial = numeric(out[source])
         out[spec["clean"]] = raw_spatial.where(raw_spatial.isin(spec["valid_codes"])).astype("Int64")
@@ -240,16 +252,9 @@ def canonicalize_trip_attributes(trips: pd.DataFrame) -> tuple[pd.DataFrame, Rec
         broad_source = "hwzweck2"
     else:
         broad_source = None
-    out["BROAD_PURPOSE"] = numeric(out[broad_source]).round().astype("Int64") if broad_source else pd.Series(pd.NA, index=out.index, dtype="Int64")
-    out["_MAIN_PURPOSE"] = numeric(out["hwzweck2"]).round().astype("Int64") if "hwzweck2" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Int64")
-
-    for column, label in [("BROAD_PURPOSE", broad_source), ("_MAIN_PURPOSE", "hwzweck2")]:
-        if label is None:
-            continue
-        values = numeric(out.loc[eligible, column])
-        unexpected = values.notna() & ~values.isin([*VALID_BROAD_PURPOSES, 99])
-        if unexpected.any():
-            raise ValueError(f"{label} contains values outside the documented 1--7 and 99 codes.")
+    official_codes = VALID_BROAD_PURPOSES | {99}
+    out["BROAD_PURPOSE"] = documented_purpose(out[broad_source], official_codes, broad_source) if broad_source else pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["_MAIN_PURPOSE"] = documented_purpose(out["hwzweck2"], official_codes, "hwzweck2") if "hwzweck2" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Int64")
 
     start_flag_valid = numeric(out["invalid_start_time_flag"]).fillna(0).eq(0) if "invalid_start_time_flag" in out.columns else True
     arrival_flag_valid = numeric(out["invalid_arrival_time_flag"]).fillna(0).eq(0) if "invalid_arrival_time_flag" in out.columns else True
@@ -381,6 +386,164 @@ def reconstruct_home_based_tours(
     return membership, tour_meta, diagnostics
 
 
+def tour_household_accompaniment(membership: pd.DataFrame) -> pd.Series:
+    """Household companion on a verified driving trip of this person's tour."""
+    require_columns(membership, ["TOUR_ID", "PERSON_KEY", "SOURCE_ROW_ID", "pkw_fmf", "W_BEGL_HH"], "tour membership")
+    if membership["SOURCE_ROW_ID"].duplicated().any():
+        raise AssertionError("Tour accompaniment requires unique member SOURCE_ROW_ID values.")
+    grouped = membership.groupby("TOUR_ID", sort=False)
+    if grouped["PERSON_KEY"].nunique(dropna=False).ne(1).any():
+        raise AssertionError("A reconstructed tour contains trips from different persons.")
+    status = numeric(membership["pkw_fmf"])
+    accompaniment = numeric(membership["W_BEGL_HH"])
+    driver = status.eq(1).fillna(False)
+    unresolved_status = ~status.isin([1, 2, 706]).fillna(False)
+    flags = pd.DataFrame({
+        "TOUR_ID": membership["TOUR_ID"],
+        "driver": driver.astype(int),
+        "yes": (driver & accompaniment.eq(1).fillna(False)).astype(int),
+        "unknown_driving_response": (driver & ~accompaniment.isin([1, 2, 716]).fillna(False)).astype(int),
+        "unresolved_driver_status": unresolved_status.astype(int),
+    })
+    counts = flags.groupby("TOUR_ID", sort=False).sum()
+    result = pd.Series(pd.NA, index=counts.index, dtype="Int64", name="HOUSEHOLD_ACCOMPANIED")
+    result.loc[counts["yes"].gt(0)] = 1
+    confirmed_no = (counts["driver"].gt(0) & counts["yes"].eq(0)
+                    & counts["unknown_driving_response"].eq(0)
+                    & counts["unresolved_driver_status"].eq(0))
+    result.loc[confirmed_no] = 0
+    return result
+
+
+VEHICLE_QA_COLUMNS = [
+    "TOUR_QA_N_IDENTIFIED_HH_DRIVER_TRIPS", "TOUR_QA_N_DISTINCT_HH_CARS",
+    "TOUR_QA_OBSERVED_CAR_SWITCH_FLAG", "TOUR_QA_DRIVER_VEHICLE_UNCERTAIN_FLAG",
+    "TOUR_QA_SWITCH_WITH_UNCERTAINTY_FLAG",
+    "TOUR_QA_COMPLETE_MULTITRIP_SINGLE_CAR_FLAG",
+    "TOUR_QA_CLOSING_FIRST_CAR_FLAG",
+]
+
+
+def vehicle_continuity(membership: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Describe observed fleet-car use without changing personal-tour membership.
+
+    `pkw_fmf=3` includes a driver/passenger change within a trip; codes 9 and
+    708 are also unresolved. A reported driver with a non-fleet or unreported
+    W_WAUTO is uncertain for household-car continuity, never a second car.
+    """
+    required = ["TOUR_ID", "PERSON_KEY", "H_ID", "SOURCE_ROW_ID", "CHAIN_ELIGIBLE",
+                "W_RBW", "pkw_fmf", "W_WAUTO", "FLEET_CAR_SET",
+                "TOUR_CLOSING_TRIP_FLAG", "CHAIN_SEQUENCE_NUM"]
+    require_columns(membership, required, "vehicle-continuity membership")
+    if membership.SOURCE_ROW_ID.duplicated().any():
+        raise AssertionError("Vehicle-continuity SOURCE_ROW_ID must be unique.")
+    if membership.groupby("TOUR_ID")[["PERSON_KEY", "H_ID"]].nunique(dropna=False).gt(1).any().any():
+        raise AssertionError("A personal tour combines persons or households.")
+    detail = membership[["TOUR_ID", "SOURCE_ROW_ID", "CHAIN_SEQUENCE_NUM",
+                         "TOUR_CLOSING_TRIP_FLAG"]].copy()
+    car = numeric(membership.W_WAUTO)
+    exact = car.notna() & np.isfinite(car) & car.eq(np.floor(car))
+    car_id = car.where(exact).astype("Int64").astype("string")
+    fleet = membership.FLEET_CAR_SET.astype("string").fillna("")
+    in_fleet = pd.Series([pd.notna(value) and value in set(cars.split("|"))
+                          for value, cars in zip(car_id, fleet)], index=membership.index)
+    status = numeric(membership.pkw_fmf)
+    driver = (numeric(membership.CHAIN_ELIGIBLE).eq(1).fillna(False)
+              & ~numeric(membership.W_RBW).eq(1).fillna(False)
+              & status.eq(1).fillna(False) & in_fleet)
+    uncertain = (status.eq(1).fillna(False) & ~in_fleet) | status.isin([3, 9, 708])
+    detail["QA_CAR_ID"] = car_id.where(driver)
+    detail["QA_IDENTIFIED_HH_DRIVER_FLAG"] = driver.astype(int)
+    detail["QA_UNCERTAIN_DRIVER_VEHICLE_FLAG"] = uncertain.astype(int)
+    counts = detail.groupby("TOUR_ID", sort=False).agg(
+        n_driver=("QA_IDENTIFIED_HH_DRIVER_FLAG", "sum"),
+        n_uncertain=("QA_UNCERTAIN_DRIVER_VEHICLE_FLAG", "sum"),
+        n_cars=("QA_CAR_ID", "nunique"),
+    )
+    first_car = detail.loc[driver].sort_values("CHAIN_SEQUENCE_NUM", key=lambda s: numeric(s)).groupby("TOUR_ID").QA_CAR_ID.first()
+    closing_car = detail.loc[driver & numeric(detail.TOUR_CLOSING_TRIP_FLAG).eq(1)].set_index("TOUR_ID").QA_CAR_ID
+    closing_matches = first_car.eq(closing_car.reindex(first_car.index)).reindex(counts.index, fill_value=False).fillna(False)
+    result = pd.DataFrame({
+        "TOUR_ID": counts.index,
+        VEHICLE_QA_COLUMNS[0]: counts.n_driver.to_numpy(int),
+        VEHICLE_QA_COLUMNS[1]: counts.n_cars.to_numpy(int),
+        VEHICLE_QA_COLUMNS[2]: counts.n_cars.ge(2).to_numpy(int),
+        VEHICLE_QA_COLUMNS[3]: counts.n_uncertain.gt(0).to_numpy(int),
+        VEHICLE_QA_COLUMNS[4]: (counts.n_cars.ge(2) & counts.n_uncertain.gt(0)).to_numpy(int),
+        VEHICLE_QA_COLUMNS[5]: (counts.n_driver.ge(2) & counts.n_cars.eq(1) & counts.n_uncertain.eq(0)).to_numpy(int),
+        VEHICLE_QA_COLUMNS[6]: closing_matches.to_numpy(int),
+    })
+    return result, detail
+
+
+def longest_household_driver_purpose(membership: pd.DataFrame) -> pd.DataFrame:
+    """Observed longest eligible household-car driving leg within each personal tour.
+
+    Duration is selected before inspecting purpose. Equal maxima assign a purpose
+    only when every tied trip has the same valid official hwzweck2 code.
+    """
+    required = ["TOUR_ID", "PERSON_KEY", "H_ID", "SOURCE_ROW_ID", "CHAIN_ELIGIBLE",
+                "W_RBW", "pkw_fmf", "W_WAUTO", "FLEET_CAR_SET",
+                "TRIP_TRAVEL_TIME_MIN", "_MAIN_PURPOSE", "_HOME_DESTINATION",
+                "TOUR_CLOSING_TRIP_FLAG"]
+    require_columns(membership, required, "tour membership")
+    if membership["SOURCE_ROW_ID"].duplicated().any():
+        raise AssertionError("Longest-driver source rows must be unique.")
+    if membership.groupby("TOUR_ID")[["PERSON_KEY", "H_ID"]].nunique(dropna=False).gt(1).any().any():
+        raise AssertionError("A tour combines persons or households.")
+
+    work = membership.copy()
+    car = numeric(work["W_WAUTO"])
+    fleet = work["FLEET_CAR_SET"].astype("string").fillna("")
+    fleet_member = pd.Series(
+        [str(int(value)) in set(cars.split("|")) if pd.notna(value) and value == int(value) else False
+         for value, cars in zip(car, fleet)], index=work.index,
+    )
+    eligible = (numeric(work["CHAIN_ELIGIBLE"]).eq(1).fillna(False)
+                & ~numeric(work["W_RBW"]).eq(1).fillna(False)
+                & numeric(work["pkw_fmf"]).eq(1).fillna(False)
+                & fleet_member)
+    work["_ELIGIBLE_HH_DRIVER"] = eligible.astype(int)
+    valid = eligible & work["TRIP_TRAVEL_TIME_MIN"].notna()
+    work["_VALID_HH_DRIVER_DURATION"] = valid.astype(int)
+    counts = work.groupby("TOUR_ID", sort=False).agg(
+        _eligible=("_ELIGIBLE_HH_DRIVER", "sum"),
+        _valid_duration=("_VALID_HH_DRIVER_DURATION", "sum"),
+    )
+    counts["TOUR_NO_ELIGIBLE_HH_DRIVER_TRIP_FLAG"] = counts["_eligible"].eq(0).astype(int)
+    counts["TOUR_NO_VALID_DRIVER_DURATION_FLAG"] = (
+        counts["_eligible"].gt(0) & counts["_valid_duration"].eq(0)
+    ).astype(int)
+    maxima = work.loc[valid].groupby("TOUR_ID")["TRIP_TRAVEL_TIME_MIN"].transform("max")
+    longest = work.loc[valid].loc[lambda d: d["TRIP_TRAVEL_TIME_MIN"].eq(maxima)].copy()
+    result = counts.drop(columns=["_eligible", "_valid_duration"])
+    purpose = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    for flag in ["TOUR_LONGEST_DURATION_TIE_FLAG", "TOUR_LONGEST_TIE_COMMON_PURPOSE_FLAG",
+                 "TOUR_LONGEST_TIE_UNRESOLVED_FLAG", "TOUR_LONGEST_PURPOSE_MISSING_FLAG",
+                 "TOUR_LONGEST_RETURN_HOME_FLAG", "TOUR_LONGEST_IS_CLOSING_TRIP_FLAG",
+                 "TOUR_LONGEST_NOT_CLOSING_TRIP_FLAG"]:
+        result[flag] = 0
+    result["TOUR_LONGEST_DRIVER_SOURCE_ROW_ID"] = pd.Series(pd.NA, index=result.index, dtype="string")
+    for tour_id, group in longest.groupby("TOUR_ID", sort=False):
+        codes = numeric(group["_MAIN_PURPOSE"])
+        valid_codes = codes.isin(VALID_BROAD_PURPOSES)
+        tied = len(group) > 1
+        common = bool(valid_codes.all() and codes.nunique() == 1)
+        if common:
+            purpose.loc[tour_id] = int(codes.iloc[0])
+        result.loc[tour_id, "TOUR_LONGEST_DURATION_TIE_FLAG"] = int(tied)
+        result.loc[tour_id, "TOUR_LONGEST_TIE_COMMON_PURPOSE_FLAG"] = int(tied and common)
+        result.loc[tour_id, "TOUR_LONGEST_TIE_UNRESOLVED_FLAG"] = int(tied and not common)
+        result.loc[tour_id, "TOUR_LONGEST_PURPOSE_MISSING_FLAG"] = int(not common and not tied)
+        result.loc[tour_id, "TOUR_LONGEST_RETURN_HOME_FLAG"] = int(group["_HOME_DESTINATION"].eq(1).any())
+        result.loc[tour_id, "TOUR_LONGEST_IS_CLOSING_TRIP_FLAG"] = int(group["TOUR_CLOSING_TRIP_FLAG"].eq(1).any())
+        result.loc[tour_id, "TOUR_LONGEST_NOT_CLOSING_TRIP_FLAG"] = int(group["TOUR_CLOSING_TRIP_FLAG"].ne(1).any())
+        if not tied:
+            result.loc[tour_id, "TOUR_LONGEST_DRIVER_SOURCE_ROW_ID"] = group["SOURCE_ROW_ID"].iloc[0]
+    result["TOUR_LONGEST_DRIVER_TRIP_HWZWECK2"] = purpose
+    return result.reset_index()
+
+
 def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd.DataFrame:
     work = membership.copy()
     work["_NONHOME_STOP"] = work["_HOME_DESTINATION"].eq(0).fillna(False).astype(int)
@@ -414,6 +577,7 @@ def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd
     travel_time = grouped["TRIP_TRAVEL_TIME_MIN"].sum(min_count=1).rename("TOUR_TRAVEL_TIME_MIN").reset_index()
     aggregate = aggregate.merge(distance, on="TOUR_ID", validate="one_to_one")
     aggregate = aggregate.merge(travel_time, on="TOUR_ID", validate="one_to_one")
+    aggregate["HOUSEHOLD_ACCOMPANIED"] = tour_household_accompaniment(membership).reindex(aggregate["TOUR_ID"]).array
     aggregate["TOUR_DISTANCE_COMPLETE_FLAG"] = aggregate["TOUR_VALID_DISTANCE_TRIPS"].eq(aggregate["TOUR_N_TRIPS"]).astype(int)
     aggregate["TOUR_TRAVEL_TIME_COMPLETE_FLAG"] = aggregate["TOUR_VALID_TRAVEL_TIME_TRIPS"].eq(aggregate["TOUR_N_TRIPS"]).astype(int)
     aggregate["TOUR_MULTI_STOP_FLAG"] = aggregate["TOUR_N_NONHOME_STOPS"].gt(1).astype(int)
@@ -505,8 +669,11 @@ def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd
         tours["TOUR_CLOSED"].eq(1)
         & numeric(tours["_TOUR_END_MAIN_PURPOSE"]).isin(VALID_BROAD_PURPOSES)
     )
-    tours["TOUR_MAIN_PURPOSE"] = numeric(tours["_TOUR_END_MAIN_PURPOSE"]).where(main_valid).round().astype("Int64")
+    tours["TOUR_MAIN_PURPOSE"] = tours["_TOUR_END_MAIN_PURPOSE"].where(main_valid).astype("Int64")
     tours["TOUR_MAIN_PURPOSE_DERIVABLE_FLAG"] = main_valid.astype(int)
+    tours = tours.merge(longest_household_driver_purpose(membership), on="TOUR_ID", validate="one_to_one")
+    continuity, _ = vehicle_continuity(membership)
+    tours = tours.merge(continuity, on="TOUR_ID", validate="one_to_one")
 
     columns = [
         "TOUR_ID",
@@ -533,6 +700,7 @@ def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd
         "LEG_PURPOSE",
         "TOUR_DISTANCE_KM",
         "TOUR_TRAVEL_TIME_MIN",
+        "HOUSEHOLD_ACCOMPANIED",
         "TOUR_ELAPSED_TIME_MIN",
         "TOUR_N_TRIPS",
         "TOUR_N_NONHOME_STOPS",
@@ -540,6 +708,18 @@ def build_tour_features(membership: pd.DataFrame, tour_meta: pd.DataFrame) -> pd
         "TOUR_MULTI_STOP_FLAG",
         "TOUR_FIRST_PURPOSE",
         "TOUR_MAIN_PURPOSE",
+        "TOUR_LONGEST_DRIVER_TRIP_HWZWECK2",
+        "TOUR_LONGEST_DRIVER_SOURCE_ROW_ID",
+        "TOUR_NO_ELIGIBLE_HH_DRIVER_TRIP_FLAG",
+        "TOUR_NO_VALID_DRIVER_DURATION_FLAG",
+        "TOUR_LONGEST_DURATION_TIE_FLAG",
+        "TOUR_LONGEST_TIE_COMMON_PURPOSE_FLAG",
+        "TOUR_LONGEST_TIE_UNRESOLVED_FLAG",
+        "TOUR_LONGEST_PURPOSE_MISSING_FLAG",
+        "TOUR_LONGEST_RETURN_HOME_FLAG",
+        "TOUR_LONGEST_IS_CLOSING_TRIP_FLAG",
+        "TOUR_LONGEST_NOT_CLOSING_TRIP_FLAG",
+        *VEHICLE_QA_COLUMNS,
         *PURPOSE_INDICATORS.values(),
         "TOUR_HAS_OTHER_PURPOSE",
         "TOUR_N_DISTINCT_PURPOSES",
@@ -845,6 +1025,17 @@ def build_qa_summary(
             qa_row("ATTRIBUTE COMPLETENESS", "tours where main purpose was not derivable", int(tours["TOUR_MAIN_PURPOSE_DERIVABLE_FLAG"].eq(0).sum()), tour_den, "reconstructed tours"),
         ]
     )
+    for column in VEHICLE_QA_COLUMNS:
+        if column.startswith("TOUR_QA_N_"):
+            continue
+        rows.append(qa_row("VEHICLE CONTINUITY", column, int(tours[column].sum()), tour_den,
+                           "reconstructed personal tours; an observed switch remains flagged when identity is also uncertain"))
+    for metric, mask in [
+        ("no identifiable household-car driver trip", tours[VEHICLE_QA_COLUMNS[0]].eq(0)),
+        ("exactly one identifiable driver trip", tours[VEHICLE_QA_COLUMNS[0]].eq(1)),
+        ("at least two identifiable driver trips", tours[VEHICLE_QA_COLUMNS[0]].ge(2)),
+    ]:
+        rows.append(qa_row("VEHICLE CONTINUITY", metric, int(mask.sum()), tour_den, "reconstructed personal tours"))
     rows.extend(
         [
             qa_row("STRICT MNL MERGE", "strict input rows", len(wide_input), strict_den, "accepted strict wide rows"),
